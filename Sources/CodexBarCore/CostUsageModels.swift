@@ -350,7 +350,7 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
         }
     }
 
-    static func localDayKey(for rawDate: String, calendar: Calendar) -> String? {
+    package static func localDayKey(for rawDate: String, calendar: Calendar) -> String? {
         let trimmed = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.count >= 10 {
             let prefix = String(trimmed.prefix(10))

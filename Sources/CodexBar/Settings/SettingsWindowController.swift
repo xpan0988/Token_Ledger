@@ -88,7 +88,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 backing: .buffered,
                 defer: false)
             window.contentViewController = hostingController
-            window.title = selection.title
+            window.title = selection.pane == .tokenLedger
+                ? settings.tokenLedger.text("ledger.title") : selection.title
             SettingsWindowToolbar.configure(window)
             SettingsWindowSizing.enforceMinimumSize(window)
             if !window.setFrameUsingName(SettingsWindowIdentity.frameAutosaveName) {

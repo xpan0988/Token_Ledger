@@ -191,10 +191,10 @@ func L(_ key: String, _ arguments: CVarArg...) -> String {
     String(format: L(key), locale: codexBarLocalizedResourceLocale(), arguments: arguments)
 }
 
-func L(_ key: String, language: String) -> String {
+func L(_ key: String, language: String, table: String? = nil) -> String {
     let resourceBundle = codexBarLocalizationResourceBundle()
     let bundle = localizedBundle(forLanguage: language)
-    return codexBarLocalizedString(key, bundle: bundle, resourceBundle: resourceBundle)
+    return codexBarLocalizedString(key, bundle: bundle, resourceBundle: resourceBundle, table: table)
 }
 
 /// Uses an explicit duration for Simplified Chinese quota surfaces while preserving the generic
@@ -253,8 +253,13 @@ func codexBarLocalizedInteger(_ value: Int) -> String {
     value.formatted(.number.locale(codexBarLocalizedLocale()))
 }
 
-func codexBarLocalizedString(_ key: String, bundle: Bundle, resourceBundle: Bundle) -> String {
-    let value = bundle.localizedString(forKey: key, value: nil, table: nil)
+func codexBarLocalizedString(
+    _ key: String,
+    bundle: Bundle,
+    resourceBundle: Bundle,
+    table: String? = nil) -> String
+{
+    let value = bundle.localizedString(forKey: key, value: nil, table: table)
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if !trimmed.isEmpty, value != key {
         return value
@@ -266,7 +271,7 @@ func codexBarLocalizedString(_ key: String, bundle: Bundle, resourceBundle: Bund
         return trimmed.isEmpty ? key : value
     }
 
-    let fallback = englishBundle.localizedString(forKey: key, value: nil, table: nil)
+    let fallback = englishBundle.localizedString(forKey: key, value: nil, table: table)
     return fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? key : fallback
 }
 

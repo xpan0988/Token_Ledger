@@ -417,6 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexAccountPromotionCoordinator: CodexAccountPromotionCoordinator?
     private var cloudSyncCoordinator: CloudSyncCoordinator?
     private var settingsWindowController: SettingsWindowController?
+    private var tokenLedgerPanelController: TokenLedgerPanelController?
     private var pendingUpdateSettingsOpen = false
     private lazy var placeholderSettingsWindowGuard = PlaceholderSettingsWindowGuard(
         isKnownSettingsWindow: { [weak self] window in
@@ -497,6 +498,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.installDebugMemoryPressureObserverIfNeeded()
         #endif
         self.ensureStatusController()
+        if let store = self.store, let settings = self.settings {
+            let controller = TokenLedgerPanelController(store: store, settings: settings) { [weak self] in
+                self?.openSettings(pane: .tokenLedger)
+            }
+            self.tokenLedgerPanelController = controller
+            controller.start()
+        }
         self.observeSettingsApplicationMenuLanguage()
         self.scheduleSettingsApplicationMenuValidation(
             missingItemRetriesRemaining: Self.settingsMenuReadinessRetryCount,

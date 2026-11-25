@@ -859,6 +859,7 @@ extension StatusItemController {
         captureMenu: NSMenu? = nil)
     {
         let actionableSections = sections.filter { section in section.entries.contains(where: \ .isActionable) }
+        self.addTokenLedgerMenu(to: menu)
         for (index, section) in actionableSections.enumerated() {
             for entry in section.entries {
                 switch entry {

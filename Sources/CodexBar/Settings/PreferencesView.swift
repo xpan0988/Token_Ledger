@@ -7,6 +7,7 @@ enum SettingsPane: Hashable {
     case general
     case iCloudSync
     case usageSpend
+    case tokenLedger
     case notifications
     case menuBar
     case menu
@@ -32,6 +33,7 @@ enum SettingsPane: Hashable {
         case .general: L("tab_general")
         case .iCloudSync: L("iCloud Sync")
         case .usageSpend: L("tab_usage_spend")
+        case .tokenLedger: TokenLedgerLanguage.english.text("ledger.title")
         case .notifications: L("tab_notifications")
         case .menuBar: L("tab_menu_bar")
         case .menu: L("tab_menu")
@@ -114,7 +116,7 @@ struct PreferencesView: View {
         .id(self.settings.appLanguage)
         .codexBarLocalized()
         .background {
-            SettingsWindowAppearanceBridge(colorScheme: self.colorScheme, windowTitle: self.selection.title)
+            SettingsWindowAppearanceBridge(colorScheme: self.colorScheme, windowTitle: self.selectedPaneTitle)
                 .allowsHitTesting(false)
         }
         .onAppear {
@@ -144,7 +146,7 @@ struct PreferencesView: View {
         } detail: {
             self.detailView
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .navigationTitle(self.selection.title)
+                .navigationTitle(self.selectedPaneTitle)
                 // Panes that draw their own heading keep the window title for accessibility and the
                 // Window menu, but drop it from the toolbar.
                 .toolbar(removing: self.showsToolbarTitle ? nil : .title)
@@ -154,6 +156,10 @@ struct PreferencesView: View {
                     }
                 }
         }
+    }
+
+    private var selectedPaneTitle: String {
+        self.selection.pane == .tokenLedger ? self.settings.tokenLedger.text("ledger.title") : self.selection.title
     }
 
     private var showsToolbarTitle: Bool {
@@ -249,6 +255,8 @@ struct PreferencesView: View {
             ICloudSyncPane(settings: self.settings, state: self.cloudSyncState)
         case .usageSpend:
             SpendDashboardPane(settings: self.settings, store: self.store)
+        case .tokenLedger:
+            TokenLedgerSettingsView(settings: self.settings, store: self.store)
         case .notifications:
             NotificationsPane(settings: self.settings)
         case .menuBar:

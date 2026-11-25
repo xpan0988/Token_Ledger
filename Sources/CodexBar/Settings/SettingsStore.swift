@@ -254,6 +254,7 @@ final class SettingsStore {
     #endif
 
     @ObservationIgnored let userDefaults: UserDefaults
+    let tokenLedger: TokenLedgerPreferences
     @ObservationIgnored lazy var httpServer = HTTPServerController(
         configURL: self.configStore.fileURL.deletingLastPathComponent().appendingPathComponent("http-server.json"))
     @ObservationIgnored let configStore: CodexBarConfigStore
@@ -406,6 +407,7 @@ final class SettingsStore {
         _ = Self.initializeOpenAIWebAccessPreference(
             userDefaults: userDefaults, config: config, hadExistingConfig: hadExistingConfig)
         self.userDefaults = userDefaults
+        self.tokenLedger = TokenLedgerPreferences(defaults: userDefaults)
         self.configStore = configStore
         self.antigravityOAuthCredentialsStore = antigravityOAuthCredentialsStore
         self.keychainAccessPolicy = keychainAccessPolicy

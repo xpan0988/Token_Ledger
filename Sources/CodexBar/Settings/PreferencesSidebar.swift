@@ -68,6 +68,7 @@ struct SettingsSidebarView: View {
         SettingsSidebarAppPane(pane: .general, systemImage: "gearshape.fill", color: .gray),
         SettingsSidebarAppPane(pane: .iCloudSync, systemImage: "icloud.fill", color: .blue),
         SettingsSidebarAppPane(pane: .usageSpend, systemImage: "chart.bar.fill", color: .green),
+        SettingsSidebarAppPane(pane: .tokenLedger, systemImage: "rectangle.on.rectangle", color: .gray),
         SettingsSidebarAppPane(pane: .notifications, systemImage: "bell.badge.fill", color: .red),
         SettingsSidebarAppPane(pane: .menuBar, systemImage: "menubar.rectangle", color: .blue),
         SettingsSidebarAppPane(pane: .menu, systemImage: "filemenu.and.selection", color: .teal),
@@ -84,7 +85,10 @@ struct SettingsSidebarView: View {
 
     private var filteredAppPanes: [SettingsSidebarAppPane] {
         let matching = Set(SettingsSearch.filteredPanes(self.availableAppPanes.map(\.pane), query: self.searchText))
-        return self.availableAppPanes.filter { matching.contains($0.pane) }
+        return self.availableAppPanes.filter { item in
+            matching.contains(item.pane) || (item.pane == .tokenLedger
+                && self.settings.tokenLedger.text("ledger.title").localizedStandardContains(self.searchText))
+        }
     }
 
     private var appPanesSection: some View {
@@ -93,7 +97,11 @@ struct SettingsSidebarView: View {
                 if item.pane == .about {
                     SettingsSidebarAboutRow(onSelect: self.onSelectAbout)
                 } else {
-                    SettingsSidebarPaneRow(pane: item.pane, systemImage: item.systemImage, color: item.color)
+                    SettingsSidebarPaneRow(
+                        pane: item.pane,
+                        systemImage: item.systemImage,
+                        color: item.color,
+                        titleOverride: item.pane == .tokenLedger ? self.settings.tokenLedger.text("ledger.title") : nil)
                 }
             }
         }
@@ -204,11 +212,12 @@ private struct SettingsSidebarPaneRow: View {
     let pane: SettingsPane
     let systemImage: String
     let color: Color
+    var titleOverride: String?
 
     var body: some View {
         HStack(spacing: 8) {
             SettingsIconChip(systemImage: self.systemImage, color: self.color)
-            Text(self.pane.title)
+            Text(self.titleOverride ?? self.pane.title)
         }
         .tag(self.pane)
     }

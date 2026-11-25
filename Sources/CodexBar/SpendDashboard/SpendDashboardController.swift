@@ -10,6 +10,7 @@ struct SpendDashboardConfiguration: Equatable, Sendable {
     let codexAccountIdentities: [String]
     let codexAccountDisplayNames: [String: String]
     let sourceOwnershipFingerprints: [String]
+    let recordedUsageScopes: [String: String]
     let sourceRevisions: [String]
     let sourcePublicationRevisions: [UInt64]
     let bucketTimeZoneIdentifier: String
@@ -25,6 +26,7 @@ struct SpendDashboardConfiguration: Equatable, Sendable {
         codexAccountIdentities: [String],
         codexAccountDisplayNames: [String: String] = [:],
         sourceOwnershipFingerprints: [String] = [],
+        recordedUsageScopes: [String: String] = [:],
         sourceRevisions: [String] = [],
         sourcePublicationRevisions: [UInt64] = [],
         bucketTimeZoneIdentifier: String = "",
@@ -39,6 +41,7 @@ struct SpendDashboardConfiguration: Equatable, Sendable {
         self.codexAccountIdentities = codexAccountIdentities
         self.codexAccountDisplayNames = codexAccountDisplayNames
         self.sourceOwnershipFingerprints = sourceOwnershipFingerprints
+        self.recordedUsageScopes = recordedUsageScopes
         self.sourceRevisions = sourceRevisions
         self.sourcePublicationRevisions = sourcePublicationRevisions
         self.bucketTimeZoneIdentifier = bucketTimeZoneIdentifier
@@ -59,6 +62,7 @@ struct SpendDashboardConfiguration: Equatable, Sendable {
         self.costUsageEnabled == other.costUsageEnabled && self.providerIDs == other.providerIDs &&
             self.codexAccountIdentities == other.codexAccountIdentities &&
             self.sourceOwnershipFingerprints == other.sourceOwnershipFingerprints &&
+            self.recordedUsageScopes == other.recordedUsageScopes &&
             self.bucketTimeZoneIdentifier == other.bucketTimeZoneIdentifier &&
             self.openCodexUsageLogsEnabled == other.openCodexUsageLogsEnabled
     }
@@ -93,6 +97,8 @@ struct CodexSpendScanRequest: Equatable, Sendable {
 
 struct CodexSpendSourceDescriptor: Sendable {
     let identity: String
+    let recordingID: String
+    let recordingScope: String
     let displayName: String
     let request: CodexSpendScanRequest?
 }
@@ -224,19 +230,18 @@ enum SpendDashboardSource {
         codexSources: [CodexSpendSourceDescriptor]) -> SpendDashboardConfiguration
     {
         let plugins = self.statisticsPlugins(store: store)
+        let ownership = self.sourceOwnership(providers: providers, settings: settings, store: store)
         return SpendDashboardConfiguration(
             costUsageEnabled: self.spendCollectionEnabled(settings: settings, providers: providers),
             preferredCurrencyCode: settings.preferredCurrencyCode,
             providerIDs: providers.map(\.rawValue) + plugins.map { "plugin/\($0.manifest.id.rawValue)" },
             codexAccountIdentities: codexSources.map(\.identity),
             codexAccountDisplayNames: self.codexDisplayNamesByID(codexSources),
-            sourceOwnershipFingerprints: self.sourceOwnershipFingerprints(
-                providers: providers,
-                settings: settings,
-                store: store) + plugins.map {
+            sourceOwnershipFingerprints: ownership.dashboard + plugins.map {
                 "plugin/\($0.manifest.id.rawValue):\(store.userPluginStatisticsScope($0)):" +
                     "\(settings.providerConfigRevision(forInstanceID: $0.manifest.id))"
             },
+            recordedUsageScopes: self.recordedUsageScopes(ownership.recorded, codexSources, plugins, settings),
             sourceRevisions: self.sourceRevisions(providers: providers, settings: settings, store: store)
                 + plugins.map { plugin in
                     let prefix = "plugin/\(plugin.manifest.id.rawValue):"
@@ -880,14 +885,15 @@ enum SpendDashboardSource {
     }
 
     @MainActor
-    private static func sourceOwnershipFingerprints(
+    private static func sourceOwnership(
         providers: [UsageProvider],
         settings: SettingsStore,
-        store: UsageStore) -> [String]
+        store: UsageStore) -> (dashboard: [String], recorded: [String: String])
     {
-        providers.compactMap { provider in
-            // Provider-specific by design: spend dashboard
-            guard provider != .codex else { return nil }
+        var dashboard: [String] = []
+        var recorded: [String: String] = [:]
+        // Provider-specific by design: Codex source ownership is established per local home.
+        for provider in providers where provider != .codex {
             var config = (settings.providerConfig(for: provider) ?? ProviderConfig(id: provider.instanceID))
                 .fetchIdentityConfig
             config.enabled = nil
@@ -901,12 +907,19 @@ enum SpendDashboardSource {
             let scope = UsageStore.usesSpendDashboardIndependentTokenSnapshot(provider)
                 ? store.spendDashboardTokenSnapshotScopeSignature(for: provider)
                 : store.tokenSnapshotScopeSignature(for: provider)
-            let accountOwnership = settings.effectiveSelectedTokenAccount(for: provider)
+            let selectedAccount = settings.effectiveSelectedTokenAccount(for: provider)
+            let accountOwnership = selectedAccount
                 .map { store.tokenAccountSnapshotCacheKey(provider: provider, account: $0) }
                 ?? "ambient"
-            return "\(provider.rawValue):\(self.sha256(encoded)):\(self.sha256(scope)):" +
-                self.sha256("\(accountOwnership)\u{0}\(settings.costUsageBucketTimeZoneIdentifier)")
+            let configHash = self.sha256(encoded)
+            dashboard.append("\(provider.rawValue):\(configHash):\(self.sha256(scope)):" +
+                self.sha256("\(accountOwnership)\u{0}\(settings.costUsageBucketTimeZoneIdentifier)"))
+            // Lifetime ownership must survive changes to reporting periods, refresh revisions, and session tokens.
+            let recordingOwner = selectedAccount?.id.uuidString ?? configHash
+            recorded[provider.rawValue] = self.sha256([recordingOwner, store.tokenCostScope(for: provider).signature]
+                .joined(separator: "\u{0}"))
         }
+        return (dashboard, recorded)
     }
 
     @MainActor
@@ -1004,6 +1017,9 @@ enum SpendDashboardSource {
         }
         return CodexSpendSourceDescriptor(
             identity: "\(id)|\(cacheIdentity)",
+            recordingID: "codex:\(id)",
+            recordingScope: self.sha256([self.sourceToken(source), homePath ?? "unavailable-home"]
+                .joined(separator: "\u{0}")),
             displayName: displayName,
             request: request)
     }
@@ -1048,6 +1064,29 @@ enum SpendDashboardSource {
     private static func currentAuthFingerprint(for request: CodexSpendScanRequest) -> String? {
         let current = CodexAuthFingerprint.fingerprint(homePath: request.homePath)
         return request.authFileWasReadable ? current : current ?? request.authFingerprint
+    }
+}
+
+extension SpendDashboardSource {
+    @MainActor
+    private static func recordedUsageScopes(
+        _ providerScopes: [String: String],
+        _ codexSources: [CodexSpendSourceDescriptor],
+        _ plugins: [UserProviderPlugin],
+        _ settings: SettingsStore) -> [String: String]
+    {
+        var scopes = providerScopes
+        for source in codexSources {
+            scopes[source.recordingID] = source.recordingScope
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for plugin in plugins {
+            let id = plugin.manifest.id
+            let pluginSettings = settings.pluginConfig(id)?.pluginSettings ?? [:]
+            scopes["plugin/\(id.rawValue)"] = self.sha256((try? encoder.encode(pluginSettings)) ?? Data())
+        }
+        return scopes
     }
 }
 

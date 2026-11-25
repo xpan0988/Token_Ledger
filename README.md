@@ -18,6 +18,18 @@ Also available as a [Linux desktop app](Integrations/Linux/README.md) with usage
 
 <img src="docs/codexbar.png" alt="CodexBar menu popover with provider tiles, usage bars, and reset countdowns" width="520" />
 
+## Token Ledger
+
+Token Ledger adds an optional macOS floating panel for provider quotas, recorded token usage, API-equivalent cost,
+and subscription payments. Enable it in **CodexBar Settings → Token Ledger**. The panel supports English and
+Simplified Chinese, with AUD as the default display currency.
+
+[Build this fork and see the validation results](docs/token-ledger/README.md).
+
+| English | 简体中文 |
+| --- | --- |
+| [![English Token Ledger panel](docs/token-ledger/token-ledger-en.png)](docs/token-ledger/token-ledger-en.png) | [![Simplified Chinese Token Ledger panel](docs/token-ledger/token-ledger-zh-Hans.png)](docs/token-ledger/token-ledger-zh-Hans.png) |
+
 ## Why
 
 - **Plan around resets.** Per-provider session, weekly, and monthly windows with countdowns to the next reset — stop guessing whether to start that long task.

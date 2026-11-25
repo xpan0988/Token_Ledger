@@ -59,7 +59,10 @@ public final class CurrencyExchange: @unchecked Sendable {
     private let lock = NSLock()
     private let defaults: UserDefaults
     private var rates = Dictionary(uniqueKeysWithValues: CurrencyExchange.currencies.map { ($0.code, $0.rate) })
+    private var verifiedRates: [String: Double] = [:]
     private var lastFetchTime: Date?
+    private var lastAttemptTime: Date?
+    private var refreshTask: Task<Void, Never>?
 
     private static let userDefaultsKey = "CodexBar.CurrencyExchangeRates"
     private static let lastFetchKey = "CodexBar.CurrencyExchangeLastFetch"
@@ -73,6 +76,7 @@ public final class CurrencyExchange: @unchecked Sendable {
         self.defaults = defaults
         if let cached = defaults.dictionary(forKey: Self.userDefaultsKey) as? [String: Double] {
             self.rates.merge(cached) { _, new in new }
+            self.verifiedRates = cached.filter { $0.value.isFinite && $0.value > 0 }
         }
         self.lastFetchTime = defaults.object(forKey: Self.lastFetchKey) as? Date
     }
@@ -121,14 +125,36 @@ public final class CurrencyExchange: @unchecked Sendable {
     /// On failure, the previously cached (or hardcoded fallback) rates remain in use.
     public func fetchLatestRatesIfNeeded(preferredCurrencyCode: String) async {
         guard Self.requiresLiveRates(preferredCurrencyCode: preferredCurrencyCode) else { return }
-        if let lastFetch = self.lock.withLock({ self.lastFetchTime }), Date().timeIntervalSince(lastFetch) < 86400 {
-            return
-        }
+        await self.refreshVerifiedRatesIfNeeded()
+    }
 
+    /// Rates actually received from the shared source. Same-currency amounts need no rate.
+    package func verifiedRateSnapshot() -> (rates: [String: Double], fetchedAt: Date?) {
+        self.lock.withLock { (self.verifiedRates, self.lastFetchTime) }
+    }
+
+    /// Used by surfaces that must distinguish missing rates from bundled fallback estimates.
+    package func refreshVerifiedRatesIfNeeded() async {
+        let task: Task<Void, Never>? = self.lock.withLock {
+            if let refreshTask = self.refreshTask { return refreshTask }
+            let now = Date()
+            if let previousFetch = self.lastFetchTime, now.timeIntervalSince(previousFetch) < 86400 { return nil }
+            if let previousAttempt = self.lastAttemptTime, now.timeIntervalSince(previousAttempt) < 300 { return nil }
+            self.lastAttemptTime = now
+            let task = Task { await self.fetchRates() }
+            self.refreshTask = task
+            return task
+        }
+        await task?.value
+    }
+
+    private func fetchRates() async {
+        defer { self.lock.withLock { self.refreshTask = nil } }
         guard let url = URL(string: "https://open.er-api.com/v6/latest/USD") else { return }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let request = URLRequest(url: url, timeoutInterval: 15)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return }
 
             struct ExchangeResponse: Decodable {
@@ -137,17 +163,18 @@ public final class CurrencyExchange: @unchecked Sendable {
             }
 
             let decoded = try JSONDecoder().decode(ExchangeResponse.self, from: data)
-            if decoded.result == "success", let newRates = decoded.rates {
-                self.lock.withLock {
-                    self.rates.merge(newRates) { _, new in new }
-                    self.lastFetchTime = Date()
-                }
-
-                self.defaults.set(newRates, forKey: Self.userDefaultsKey)
-                self.defaults.set(Date(), forKey: Self.lastFetchKey)
+            guard decoded.result == "success", let rates = decoded.rates, rates["USD"] == 1 else { return }
+            let verified = rates.filter { $0.value.isFinite && $0.value > 0 }
+            let now = Date()
+            self.lock.withLock {
+                self.rates.merge(verified) { _, new in new }
+                self.verifiedRates = verified
+                self.lastFetchTime = now
             }
+            self.defaults.set(verified, forKey: Self.userDefaultsKey)
+            self.defaults.set(now, forKey: Self.lastFetchKey)
         } catch {
-            // Ignore fetch errors, keep using fallback / cached rates.
+            // Keep the rate table from the last successful response.
         }
     }
 }

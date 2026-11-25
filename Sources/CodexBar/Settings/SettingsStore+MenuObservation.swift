@@ -64,6 +64,7 @@ extension SettingsStore {
         _ = self.costComparisonPeriodsEnabled
         _ = self.costSummaryDisplayStyle
         _ = self.appLanguage
+        _ = self.tokenLedger.menuSignature
         _ = self.hidePersonalInfo
         _ = self.randomBlinkEnabled
         _ = self.confettiOnSessionLimitResetsEnabled

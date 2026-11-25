@@ -18,6 +18,7 @@ extension StatusItemController {
             L("Overview"),
             L("Cost"),
             pluginSignature,
+            self.settings.tokenLedger.menuSignature,
         ].joined(separator: "|")
     }
 
