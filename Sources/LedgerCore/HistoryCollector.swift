@@ -294,7 +294,14 @@ package actor HistoryCollector {
         var state = LedgerState(timeZone: self.legacyZone ?? TimeZone.current.identifier)
         if FileManager.default.fileExists(atPath: self.file.path) {
             do {
-                return try JSONDecoder().decode(LedgerState.self, from: Data(contentsOf: self.file))
+                var restored = try JSONDecoder().decode(LedgerState.self, from: Data(contentsOf: self.file))
+                if restored.pricingInputsVersion == nil {
+                    // Revisit accessible originals once. Keep unmatched pre-migration token records.
+                    restored.cursors.removeAll()
+                    restored.pricingInputsVersion = 1
+                    self.dirty = true
+                }
+                return restored
             } catch { self.unreadable = true }
         } else if let legacyFile, let data = try? Data(contentsOf: legacyFile),
                   let legacy = try? JSONDecoder().decode(LegacyHistory.self, from: data)

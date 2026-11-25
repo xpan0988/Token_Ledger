@@ -41,6 +41,8 @@ struct AccountingTests {
             }
         }
         let persisted = try JSONEncoder().encode(ledger)
+        let encoded = try #require(String(bytes: persisted, encoding: .utf8))
+        #expect(!encoded.contains("\"cost\""))
         let restored = try JSONDecoder().decode(LedgerState.self, from: persisted)
         #expect(restored.events.count == 1)
         #expect(restored.totals(stale: false, partial: false).totalTokens == 110)
@@ -109,22 +111,26 @@ struct AccountingTests {
     func `dated migration combines disjoint days and takes a lower bound for an overlapping day`() throws {
         var ledger = LedgerState(timeZone: "UTC")
         ledger.legacyDays[.codex] = [
-            "2026-11-08": HistoryBucket(tokens: 5_000_000_000, cost: 2),
-            "2026-11-10": HistoryBucket(tokens: 800, cost: 3),
+            "2026-11-08": HistoryBucket(tokens: 5_000_000_000),
+            "2026-11-10": HistoryBucket(tokens: 800),
         ]
-        ledger.legacyUndated[.codex] = HistoryBucket(tokens: 5_000_000_900, cost: 5)
+        ledger.legacyUndated[.codex] = HistoryBucket(tokens: 5_000_000_900)
         let now = try #require(TranscriptState.date(self.timestamp))
-        ledger.record(.init(identity: "new", date: now, tokens: 1200, cost: 4, authoritative: true), provider: .codex)
+        let pricing = RequestPricing(
+            date: now, model: "gpt-5.4", tokens: .init(input: 1200, cached: 0, written: 0, output: 0))
+        ledger.record(
+            .init(identity: "new", date: now, tokens: 1200, pricing: pricing, authoritative: true),
+            provider: .codex)
         ledger.record(.init(
             identity: "next",
             date: now.addingTimeInterval(86400),
             tokens: 210,
-            cost: 1,
             authoritative: true), provider: .codex)
         let result = ledger.totals(stale: false, partial: false)
         #expect(result.totalTokens == 5_000_001_410)
         #expect(result.tokenCoverageIsPartial)
-        #expect(result.apiCosts.first?.value == 7)
+        #expect(result.apiCosts.first?.value == Decimal(string: "0.003"))
+        #expect(result.priceCoverageIsPartial)
     }
 
     @Test
@@ -149,14 +155,88 @@ struct AccountingTests {
         let migrated = HistoryCollector(file: file, locations: locations, legacyFile: legacyFile, legacyZone: "UTC")
         let result = await migrated.collect([])
         #expect(result.totals.totalTokens == 5_000_000_020)
-        #expect(result.totals.apiCosts == [TokenLedgerAmount(currency: "USD", value: 11)])
+        #expect(result.totals.apiCosts.isEmpty)
         #expect(result.totals.tokenCoverageIsPartial)
+        #expect(result.totals.priceCoverageIsPartial)
         #expect(!result.persistenceFailed)
         let original = try Data(contentsOf: legacyFile)
         #expect(original == snapshot)
 
         let reloaded = HistoryCollector(file: file, locations: locations)
         #expect(await reloaded.collect([]).totals == result.totals)
+    }
+
+    @Test
+    func `frozen event prices are discarded and matching originals supply pricing inputs once`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let sessions = root.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let history = root.appendingPathComponent("history.json")
+        let source = sessions.appendingPathComponent("original.jsonl")
+        let usage = self.count(100, 40, 10)
+        let rows = try [
+            self.entry("session_meta", ["id": "session"]),
+            self.entry("turn_context", ["model": "gpt-5.4"]),
+            self.entry("token_usage_record", [
+                "thread_id": "session", "response_id": "retained", "usage": usage, "thread_token_usage": usage,
+            ]),
+        ]
+        try rows.reduce(into: Data()) { $0.append($1); $0.append(0x0A) }.write(to: source)
+        let old = try self.line([
+            "timeZone": "UTC",
+            "events": [
+                LedgerIdentity.hash("codex-response:retained"): [
+                    "provider": "codex", "day": "2026-11-10", "tokens": 110, "cost": 100, "authoritative": true,
+                ],
+                "rotated": [
+                    "provider": "codex", "day": "2026-11-09", "tokens": 250, "cost": 999, "authoritative": true,
+                ],
+            ],
+            "aliases": [:], "ambiguousAliases": [], "cursors": [:], "partialProviders": [],
+            "observedProviders": ["codex"], "legacyDays": [], "legacyUndated": [],
+        ])
+        try old.write(to: history)
+        let locations = UsageLocations(codex: root, claude: root)
+        let collector = HistoryCollector(file: history, locations: locations)
+        let result = await collector.collect([.codex])
+        #expect(result.totals.totalTokens == 360)
+        #expect(result.totals.priceCoverageIsPartial)
+        let amount = try #require(result.totals.apiCosts.first).value
+        #expect(abs(NSDecimalNumber(decimal: amount).doubleValue - 0.00031) < 1e-12)
+        let reloaded = HistoryCollector(file: history, locations: locations)
+        let withoutReplay = await reloaded.collect([.codex])
+        #expect(withoutReplay.totals == result.totals)
+    }
+
+    @Test
+    func `historical price cuts use the timestamp and Haiku uses the full prompt`() throws {
+        let million = TokenCounts(input: 0, cached: 1_000_000, written: 0, output: 0)
+        let before = try #require(TranscriptState.date("2026-10-06T23:59:59Z"))
+        let after = try #require(TranscriptState.date("2026-10-07T00:00:00Z"))
+        #expect(LedgerPricing.claudeCost(model: "claude-sonnet-5-5", tokens: million, oneHour: 0, date: before) == 0.20)
+        #expect(LedgerPricing.claudeCost(model: "claude-sonnet-5-5", tokens: million, oneHour: 0, date: after) == 0.10)
+        let long = TokenCounts(input: 1, cached: 100_000, written: 0, output: 100)
+        let haiku = try #require(LedgerPricing.claudeCost(
+            model: "claude-haiku-5-5",
+            tokens: long,
+            oneHour: 0,
+            date: after))
+        #expect(abs(haiku - 0.0052505) < 1e-12)
+        let request = TokenCounts(input: 1000, cached: 500, written: 0, output: 100)
+        let july = try #require(TranscriptState.date("2026-07-29T23:59:59Z"))
+        let august = try #require(TranscriptState.date("2026-08-20T23:59:59Z"))
+        for (model, oldDate, oldPrice, newPrice) in [
+            ("gpt-5.6-terra", july, 0.002875, 0.0023),
+            ("gpt-5.6-luna", july, 0.00115, 0.00023),
+            ("gpt-5.6-sol", august, 0.00575, 0.0042),
+        ] {
+            let old = try #require(LedgerPricing.codexCost(model: model, tokens: request, date: oldDate, tier: nil))
+            let newDate = oldDate.addingTimeInterval(1)
+            let new = try #require(LedgerPricing.codexCost(model: model, tokens: request, date: newDate, tier: nil))
+            #expect(abs(old - oldPrice) < 1e-12)
+            #expect(abs(new - newPrice) < 1e-12)
+        }
     }
 
     @Test

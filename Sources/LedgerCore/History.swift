@@ -2,26 +2,18 @@ import Foundation
 
 struct HistoryBucket: Codable {
     var tokens: Decimal
-    var cost: Decimal?
-    var currency = "USD"
-    var unpriced = false
-
-    mutating func add(_ other: Self) {
-        self.tokens += other.tokens
-        if let cost = other.cost { self.cost = (self.cost ?? 0) + cost }
-        self.unpriced = self.unpriced || other.unpriced
-    }
 }
 
 struct HistoricalEvent: Codable {
     let provider: ProviderInstanceID
     let day: String
     let tokens: Decimal
-    let cost: Double?
+    let pricing: RequestPricing?
     let authoritative: Bool
 }
 
 struct LedgerState: Codable {
+    var pricingInputsVersion: Int? = 1
     var timeZone = TimeZone.current.identifier
     var deletedThrough: Date?
     var events: [String: HistoricalEvent] = [:]
@@ -47,7 +39,8 @@ struct LedgerState: Codable {
             // Keep the largest complete observation of a request. Streamed rows can
             // carry progressively larger output totals under the same message ID.
             guard row.tokens > prior.tokens
-                || (row.tokens == prior.tokens && prior.cost == nil && row.cost != nil)
+                || (row.tokens == prior.tokens && row.pricing != nil
+                    && (prior.pricing == nil || (prior.pricing?.model == nil && row.pricing?.model != nil)))
             else { return }
         } else if let alias = row.alias {
             if let weak = self.events[alias], !weak.authoritative {
@@ -60,7 +53,7 @@ struct LedgerState: Codable {
             provider: provider,
             day: day,
             tokens: row.tokens,
-            cost: row.cost,
+            pricing: row.pricing,
             authoritative: row.authoritative)
         self.observedProviders.insert(provider)
     }
@@ -73,13 +66,16 @@ struct LedgerState: Codable {
         var totals = TokenLedgerTotals()
         totals.stale = stale
         totals.tokenCoverageIsPartial = partial || !self.partialProviders.isEmpty
-        var current: [ProviderInstanceID: [String: HistoryBucket]] = [:]
+        var current: [ProviderInstanceID: [String: Decimal]] = [:]
+        var knownCost: Decimal?
         for event in self.events.values {
-            let cost = event.cost.flatMap(TokenLedgerFormatting.decimal)
-            current[event.provider, default: [:]][event.day, default: HistoryBucket(tokens: 0)]
-                .add(HistoryBucket(tokens: event.tokens, cost: cost, unpriced: cost == nil))
+            current[event.provider, default: [:]][event.day, default: 0] += event.tokens
+            if let cost = event.pricing?.cost(for: event.provider).flatMap(TokenLedgerFormatting.decimal) {
+                knownCost = (knownCost ?? 0) + cost
+            } else {
+                totals.priceCoverageIsPartial = true
+            }
         }
-        var amounts: [String: Decimal] = [:]
         let providers = Set(current.keys).union(self.legacyDays.keys).union(self.legacyUndated.keys)
         for provider in providers {
             var dates = current[provider] ?? [:]
@@ -88,23 +84,19 @@ struct LedgerState: Codable {
                     // The old checkpoint lacks event IDs. Day boundaries prove that
                     // different dates are disjoint. A shared day is a lower bound.
                     totals.tokenCoverageIsPartial = true
-                    let retained = new.tokens >= old.tokens ? new : old
-                    dates[day] = retained
+                    dates[day] = max(new, old.tokens)
+                    totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || old.tokens > new
                 } else {
-                    dates[day] = old
+                    dates[day] = old.tokens
+                    totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || old.tokens > 0
                 }
             }
-            let dated = dates.values.reduce(Decimal.zero) { $0 + $1.tokens }
+            let dated = dates.values.reduce(Decimal.zero, +)
             if let old = self.legacyUndated[provider], old.tokens > dated {
                 totals.tokens[provider] = old.tokens
-                if let cost = old.cost { amounts[old.currency, default: 0] += cost }
                 totals.priceCoverageIsPartial = true
             } else {
                 totals.tokens[provider] = dated
-                for bucket in dates.values {
-                    if let cost = bucket.cost { amounts[bucket.currency, default: 0] += cost }
-                    totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || bucket.unpriced
-                }
             }
             totals.tokenCoverageIsPartial = totals.tokenCoverageIsPartial || self.legacyUndated[provider] != nil
         }
@@ -112,8 +104,7 @@ struct LedgerState: Codable {
             totals.tokens[provider] = 0
         }
         totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || totals.tokenCoverageIsPartial
-        totals.apiCosts = amounts.sorted { $0.key < $1.key }
-            .map { TokenLedgerAmount(currency: $0.key, value: $0.value) }
+        totals.apiCosts = knownCost.map { [TokenLedgerAmount(currency: "USD", value: $0)] } ?? []
         return totals
     }
 
@@ -135,7 +126,6 @@ struct LegacyHistory: Decodable {
 
     struct Bucket: Decodable {
         let tokens: Decimal?
-        let cost: Decimal?
     }
 
     struct Source: Decodable {
@@ -161,19 +151,16 @@ struct LegacyHistory: Decodable {
                 for (day, old) in source.days
                     where day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
                 {
-                    guard let bucket = Self.bucket(old, currency: key.currency) else { continue }
+                    guard let bucket = Self.bucket(old) else { continue }
                     let previous = state.legacyDays[provider]?[day]
                     if previous != nil { state.partialProviders.insert(provider) }
                     if bucket.tokens > previous?.tokens ?? -1 {
                         state.legacyDays[provider, default: [:]][day] = bucket
                     }
                 }
-                let sessions = source.sessions.values.compactMap { Self.bucket($0, currency: key.currency) }
+                let sessions = source.sessions.values.compactMap(Self.bucket)
                 guard !sessions.isEmpty else { continue }
-                var undated = HistoryBucket(tokens: 0, currency: key.currency)
-                for session in sessions {
-                    undated.add(session)
-                }
+                let undated = HistoryBucket(tokens: sessions.map(\.tokens).reduce(0, +))
                 let dayTotal = source.days.values.compactMap(\.tokens).reduce(Decimal.zero, +)
                 if undated.tokens > dayTotal, undated.tokens > state.legacyUndated[provider]?.tokens ?? 0 {
                     state.legacyUndated[provider] = undated
@@ -182,9 +169,8 @@ struct LegacyHistory: Decodable {
         }
     }
 
-    private static func bucket(_ old: Bucket, currency: String) -> HistoryBucket? {
+    private static func bucket(_ old: Bucket) -> HistoryBucket? {
         guard let tokens = old.tokens, !tokens.isNaN, tokens >= 0 else { return nil }
-        let cost = old.cost.flatMap { !$0.isNaN && $0 >= 0 ? $0 : nil }
-        return HistoryBucket(tokens: tokens, cost: cost, currency: currency, unpriced: cost == nil && tokens > 0)
+        return HistoryBucket(tokens: tokens)
     }
 }

@@ -59,8 +59,28 @@ struct UsageObservation {
     var alias: String?
     var date: Date
     var tokens: Decimal
-    var cost: Double?
+    var pricing: RequestPricing?
     var authoritative: Bool
+}
+
+struct RequestPricing: Codable {
+    let date: Date
+    let model: String?
+    let tokens: TokenCounts
+    var tier: String?
+    var speed: String?
+    var inferenceGeo: String?
+    var oneHour: Int?
+
+    func cost(for provider: ProviderInstanceID) -> Double? {
+        if provider == .codex {
+            return LedgerPricing.codexCost(model: self.model, tokens: self.tokens, date: self.date, tier: self.tier)
+        }
+        guard provider == .claude, let model = self.model else { return nil }
+        return LedgerPricing.claudeCost(
+            model: model, tokens: self.tokens, oneHour: self.oneHour ?? 0,
+            date: self.date, tier: self.tier, speed: self.speed, inferenceGeo: self.inferenceGeo)
+    }
 }
 
 struct TranscriptState: Codable {
@@ -137,7 +157,7 @@ struct TranscriptState: Codable {
             alias: Self.codexMirror(thread: thread, total: total),
             date: date,
             tokens: usage.total,
-            cost: LedgerPricing.codexCost(model: model, tokens: usage, date: date, tier: tier),
+            pricing: RequestPricing(date: date, model: model, tokens: usage, tier: tier),
             authoritative: true)
     }
 
@@ -183,7 +203,7 @@ struct TranscriptState: Codable {
             identity: Self.codexMirror(thread: thread, total: total),
             date: date,
             tokens: delta.total,
-            cost: LedgerPricing.codexCost(model: self.model, tokens: delta, date: date, tier: self.tier),
+            pricing: RequestPricing(date: date, model: self.model, tokens: delta, tier: self.tier),
             authoritative: false)
     }
 
@@ -201,14 +221,17 @@ struct TranscriptState: Codable {
            raw["cache_read_input_tokens"] == nil, raw["cache_creation_input_tokens"] == nil
         { return nil }
         let request = Self.identifier(object["requestId"] ?? object["request_id"])
-        let oneHour = TokenCounts.integer((raw["cache_creation"] as? [String: Any])?["ephemeral_1h_input_tokens"]) ?? 0
+        let oneHour = TokenCounts.integer((raw["cache_creation"] as? [String: Any])?["ephemeral_1h_input_tokens"])
         return UsageObservation(
             identity: request.map { LedgerIdentity.hash("claude-request:\(messageID):\($0)") }
                 ?? LedgerIdentity.hash("claude-message:\(messageID)"),
             alias: request.map { _ in LedgerIdentity.hash("claude-message:\(messageID)") },
             date: date,
             tokens: tokens.total + Decimal(tokens.cached) + Decimal(tokens.written),
-            cost: LedgerPricing.claudeCost(model: model, tokens: tokens, oneHour: oneHour, date: date),
+            pricing: RequestPricing(
+                date: date, model: model, tokens: tokens,
+                tier: Self.identifier(raw["service_tier"]), speed: Self.identifier(raw["speed"]),
+                inferenceGeo: Self.identifier(raw["inference_geo"]), oneHour: oneHour),
             authoritative: request != nil)
     }
 

@@ -186,7 +186,32 @@ enum LedgerPricing {
             cacheReadInputCostPerToken: 1.25e-6),
     ]
 
+    private static func claudeListPrice(
+        input: Double, output: Double, cacheRead: Double,
+        threshold: Int? = nil, above: ClaudePricing? = nil) -> ClaudePricing
+    {
+        let million = 1_000_000.0
+        return ClaudePricing(
+            inputCostPerToken: input / million,
+            outputCostPerToken: output / million,
+            cacheCreationInputCostPerToken: 1.25 * input / million,
+            cacheReadInputCostPerToken: cacheRead / million,
+            thresholdTokens: threshold,
+            inputCostPerTokenAboveThreshold: above?.inputCostPerToken,
+            outputCostPerTokenAboveThreshold: above?.outputCostPerToken,
+            cacheCreationInputCostPerTokenAboveThreshold: above?.cacheCreationInputCostPerToken,
+            cacheReadInputCostPerTokenAboveThreshold: above?.cacheReadInputCostPerToken)
+    }
+
     private static let claude: [String: ClaudePricing] = [
+        // Launch rates for the four observed Claude IDs, in USD per million tokens.
+        // https://platform.claude.com/docs/en/about-claude/pricing
+        "claude-opus-5-5": Self.claudeListPrice(input: 4, output: 20, cacheRead: 0.20),
+        "claude-sonnet-5-5": Self.claudeListPrice(input: 2, output: 10, cacheRead: 0.10),
+        "claude-fable-5-2": Self.claudeListPrice(input: 8, output: 40, cacheRead: 0.20),
+        "claude-haiku-5-5": Self.claudeListPrice(
+            input: 0.10, output: 0.50, cacheRead: 0.01, threshold: 100_000,
+            above: Self.claudeListPrice(input: 0.50, output: 2.50, cacheRead: 0.05)),
         "claude-fable-5": ClaudePricing(
             inputCostPerToken: 1e-5,
             outputCostPerToken: 5e-5,
@@ -387,6 +412,10 @@ enum LedgerPricing {
     ]
 
     private static let claudeFullContextStandardPricingCutoff = Date(timeIntervalSince1970: 1_773_360_000)
+    // Anthropic reduced Sonnet 5.5 cache reads on 2026-10-07. Other rates were unchanged.
+    // https://platform.claude.com/docs/en/release-notes/overview
+    private static let claudeSonnet55CacheCutoff = Date(timeIntervalSince1970: 1_791_331_200)
+    private static let claudeSonnet55Launch = Self.claudeListPrice(input: 2, output: 10, cacheRead: 0.20)
     private static let claudeHistoricalLongContext: [String: ClaudePricing] = [
         "claude-opus-4-6": ClaudePricing(
             inputCostPerToken: 5e-6,
@@ -603,12 +632,29 @@ enum LedgerPricing {
         }
     }
 
-    static func claudeCost(model: String, tokens: TokenCounts, oneHour: Int, date: Date) -> Double? {
+    static func claudeCost(
+        model: String, tokens: TokenCounts, oneHour: Int, date: Date,
+        tier: String? = nil, speed: String? = nil, inferenceGeo: String? = nil) -> Double?
+    {
+        guard tier == nil || tier == "standard" else { return nil }
         let key = self.normalizeClaudeModel(model)
-        let rate = date < self.claudeFullContextStandardPricingCutoff
-            ? self.claudeHistoricalLongContext[key] ?? self.claude[key] : self.claude[key]
+        let rate: ClaudePricing? = if key == "claude-sonnet-5-5" && date < self.claudeSonnet55CacheCutoff {
+            self.claudeSonnet55Launch
+        } else if date < self.claudeFullContextStandardPricingCutoff {
+            self.claudeHistoricalLongContext[key] ?? self.claude[key]
+        } else {
+            self.claude[key]
+        }
+        let speedMultiplier: Double
+        switch speed {
+        case nil, "standard": speedMultiplier = 1
+        case "fast" where key == "claude-opus-5-5" || key == "claude-fable-5-2" || key == "claude-opus-4-8":
+            speedMultiplier = 2
+        default: return nil
+        }
+        let geographyMultiplier = inferenceGeo == "us" ? 1.1 : 1.0
         return rate.map {
-            self.claudeCostUSD(
+            speedMultiplier * geographyMultiplier * self.claudeCostUSD(
                 pricing: $0,
                 tokens: ClaudeCostTokens(
                     input: tokens.input,
