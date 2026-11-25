@@ -35,6 +35,7 @@
 "ledger.recordedOnly" = "Lifetime usage recorded from accessible local provider logs.";
 "ledger.partialTokens" = "Some token history is unavailable. The total covers recorded data only.";
 "ledger.partialCost" = "Some recorded usage has no eligible API list price.";
+"ledger.currentPriceEstimate" = "Some requests use the latest cached list prices because historical rates are unavailable.";
 "ledger.lastKnown" = "Last known data";
 "ledger.persistenceFailed" = "The latest history could not be saved locally.";
 "ledger.estimateOnly" = "Theoretical API list-price estimate.";

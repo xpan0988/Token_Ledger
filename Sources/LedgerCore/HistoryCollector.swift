@@ -54,12 +54,17 @@ package actor HistoryCollector {
     private var inventory: [ProviderInstanceID: [URL]] = [:]
     private var nextFile: [ProviderInstanceID: Int] = [:]
     private var enabled: Set<ProviderInstanceID> = []
+    private var prices = ModelPriceCatalog()
 
     package init(file: URL, locations: UsageLocations, legacyFile: URL? = nil, legacyZone: String? = nil) {
         self.file = file
         self.locations = locations
         self.legacyFile = legacyFile
         self.legacyZone = legacyZone
+    }
+
+    package func updatePricing(_ prices: ModelPriceCatalog) {
+        self.prices = prices
     }
 
     package func collect(_ enabled: Set<ProviderInstanceID>) -> Result {
@@ -99,7 +104,7 @@ package actor HistoryCollector {
         let failed = !self.saveIfNeeded(state)
         let missing = !Set(state.events.values.map(\.provider)).union(state.observedProviders).isSuperset(of: enabled)
         return Result(
-            totals: state.totals(stale: enabled.isEmpty, partial: pending || missing),
+            totals: state.totals(stale: enabled.isEmpty, partial: pending || missing, prices: self.prices),
             pending: pending,
             persistenceFailed: failed)
     }

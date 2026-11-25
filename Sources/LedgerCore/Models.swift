@@ -75,6 +75,8 @@ package struct TokenLedgerTotals: Sendable, Equatable {
     package var apiCosts: [TokenLedgerAmount] = []
     package var tokenCoverageIsPartial = false
     package var priceCoverageIsPartial = false
+    package var usesCurrentPriceEstimate = false
+    package var unknownPricingModels: Set<String> = []
     package var stale = false
 
     package init() {}

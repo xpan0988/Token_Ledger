@@ -35,6 +35,7 @@
 "ledger.recordedOnly" = "从可访问的本地服务商日志记录的累计用量。";
 "ledger.partialTokens" = "部分 Token 历史暂不可用，合计仅涵盖已记录数据。";
 "ledger.partialCost" = "部分已记录用量缺少可用的 API 标价。";
+"ledger.currentPriceEstimate" = "部分请求缺少历史价格，按当前 API 标价估算。";
 "ledger.lastKnown" = "最近一次可用数据";
 "ledger.persistenceFailed" = "最新历史记录未能保存到本机。";
 "ledger.estimateOnly" = "按 API 标价估算的金额。";

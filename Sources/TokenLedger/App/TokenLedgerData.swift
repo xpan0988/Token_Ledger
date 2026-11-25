@@ -14,11 +14,14 @@ final class TokenLedgerData {
     @ObservationIgnored private let preferences: TokenLedgerPreferences
     @ObservationIgnored private let collector: HistoryCollector
     @ObservationIgnored private let rates: CurrencyCache
+    @ObservationIgnored private let priceCatalog: PricingCatalogStore
     @ObservationIgnored private let probeDirectory: URL
     @ObservationIgnored private var quotaTask: Task<Void, Never>?
     @ObservationIgnored private var historyTask: Task<Void, Never>?
     @ObservationIgnored private var currencyTask: Task<Void, Never>?
     @ObservationIgnored private var timer: Task<Void, Never>?
+    @ObservationIgnored private var pricingTask: Task<Void, Never>?
+    @ObservationIgnored private var loadedPricing = false
     @ObservationIgnored private var lastEnabled: Set<ProviderInstanceID>?
 
     init(preferences: TokenLedgerPreferences, directory: URL, legacy: LegacyMigration?) {
@@ -29,6 +32,7 @@ final class TokenLedgerData {
             legacyFile: legacy?.historyFile,
             legacyZone: legacy?.timeZone)
         self.rates = CurrencyCache(file: directory.appendingPathComponent("rates.json"))
+        self.priceCatalog = PricingCatalogStore(directory: directory)
         self.probeDirectory = directory.appendingPathComponent("Provider Probes", isDirectory: true)
     }
 
@@ -72,15 +76,23 @@ final class TokenLedgerData {
         self.refreshHistory()
         self.refreshQuotas()
         self.refreshCurrency()
+        self.refreshPricing(unknownModels: self.totals.unknownPricingModels)
     }
 
     private func refreshHistory() {
         guard self.historyTask == nil else { return }
         self.historyTask = Task { [weak self] in
+            guard let self else { return }
+            if !self.loadedPricing {
+                await self.collector.updatePricing(self.priceCatalog.snapshot())
+                self.loadedPricing = true
+            }
             while !Task.isCancelled {
-                guard let self else { return }
                 let result = await self.collector.collect(self.enabled)
                 guard !Task.isCancelled else { return }
+                if self.totals.unknownPricingModels != result.totals.unknownPricingModels {
+                    self.refreshPricing(unknownModels: result.totals.unknownPricingModels)
+                }
                 self.totals = result.totals
                 self.persistenceFailed = result.persistenceFailed
                 self.refreshCurrency()
@@ -89,6 +101,20 @@ final class TokenLedgerData {
                     return
                 }
                 try? await Task.sleep(for: .milliseconds(900))
+            }
+        }
+    }
+
+    private func refreshPricing(unknownModels: Set<String>) {
+        guard self.pricingTask == nil else { return }
+        let store = self.priceCatalog
+        self.pricingTask = Task { [weak self] in
+            let update = await store.refresh(unknownModels: unknownModels)
+            guard let self else { return }
+            self.pricingTask = nil
+            if let update {
+                await self.collector.updatePricing(update)
+                self.refreshHistory()
             }
         }
     }

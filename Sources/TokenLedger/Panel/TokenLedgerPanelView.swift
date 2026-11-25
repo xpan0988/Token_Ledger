@@ -180,6 +180,7 @@ struct TokenLedgerPanelView: View {
         let priceNotes = [
             self.preferences.text("ledger.estimateOnly"),
             totals.priceCoverageIsPartial ? self.preferences.text("ledger.partialCost") : nil,
+            totals.usesCurrentPriceEstimate ? self.preferences.text("ledger.currentPriceEstimate") : nil,
             totals.stale ? self.preferences.text("ledger.lastKnown") : nil,
         ].compactMap(\.self)
         let includesEstimates = payments.contains(where: \.estimated)

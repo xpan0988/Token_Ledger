@@ -71,6 +71,12 @@ struct RequestPricing: Codable {
     var speed: String?
     var inferenceGeo: String?
     var oneHour: Int?
+    var codexCacheRetention: String?
+
+    func contextSize(for provider: ProviderInstanceID) -> Decimal {
+        let input = Decimal(self.tokens.input)
+        return provider == .claude ? input + Decimal(self.tokens.cached) + Decimal(self.tokens.written) : input
+    }
 
     func cost(for provider: ProviderInstanceID) -> Double? {
         if provider == .codex {
@@ -157,7 +163,9 @@ struct TranscriptState: Codable {
             alias: Self.codexMirror(thread: thread, total: total),
             date: date,
             tokens: usage.total,
-            pricing: RequestPricing(date: date, model: model, tokens: usage, tier: tier),
+            pricing: RequestPricing(
+                date: date, model: model, tokens: usage, tier: tier,
+                codexCacheRetention: Self.identifier(payload["prompt_cache_retention"])),
             authoritative: true)
     }
 

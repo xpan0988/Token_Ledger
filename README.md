@@ -51,9 +51,12 @@ Build requirements and packaging are independent of provider setup. Enable **Lau
   Deleting recorded usage clears the local ledger and sets a cutoff so replayed older logs stay excluded.
 - Some legacy or forked transcripts and migrated same-day totals cannot be joined exactly. Partial totals are shown
   as lower bounds. Unrecognized prices, uncertain service tiers and unsupported routes may leave cost coverage partial.
-- API-equivalent valuation uses the bundled list prices effective at the request timestamp. The ledger retains
-  pricing inputs so updated price tables can revalue recorded requests. An older checkpoint is replayed once to
-  recover those inputs. Tokens with unavailable originals remain recorded and their cost remains unpriced.
+- API-equivalent valuation uses the model-prices timeline at the request timestamp. Bundled rates and then
+  current models.dev prices cover gaps. The app checks the catalogs daily while running and limits
+  additional checks for unknown models to one per hour. The last valid public catalog remains available offline.
+- The ledger retains request inputs and recalculates costs when the catalog changes. An older checkpoint is
+  replayed once to recover those inputs. Tokens with unavailable originals remain recorded and their cost
+  remains unpriced. The API Equivalent tooltip identifies current-price estimates when they contribute.
 - Reading unseen compressed Codex archives requires a local `zstd` executable. Quota access can be unavailable when
   the vendor CLI cannot show its usage panel or returns an error. Cached exchange rates remain available offline.
 - **Total Paid** is based on manual records in their original currencies. It can include marked estimates.

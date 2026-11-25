@@ -62,7 +62,7 @@ struct LedgerState: Codable {
         self = LedgerState(timeZone: self.timeZone, deletedThrough: cutoff, cursors: self.cursors)
     }
 
-    func totals(stale: Bool, partial: Bool) -> TokenLedgerTotals {
+    func totals(stale: Bool, partial: Bool, prices: ModelPriceCatalog = .init()) -> TokenLedgerTotals {
         var totals = TokenLedgerTotals()
         totals.stale = stale
         totals.tokenCoverageIsPartial = partial || !self.partialProviders.isEmpty
@@ -70,10 +70,14 @@ struct LedgerState: Codable {
         var knownCost: Decimal?
         for event in self.events.values {
             current[event.provider, default: [:]][event.day, default: 0] += event.tokens
-            if let cost = event.pricing?.cost(for: event.provider).flatMap(TokenLedgerFormatting.decimal) {
+            if let quote = event.pricing.flatMap({ prices.quote($0, provider: event.provider) }),
+               let cost = TokenLedgerFormatting.decimal(quote.usd)
+            {
                 knownCost = (knownCost ?? 0) + cost
+                totals.usesCurrentPriceEstimate = totals.usesCurrentPriceEstimate || quote.basis == .current
             } else {
                 totals.priceCoverageIsPartial = true
+                if let model = event.pricing?.model { totals.unknownPricingModels.insert(model) }
             }
         }
         let providers = Set(current.keys).union(self.legacyDays.keys).union(self.legacyUndated.keys)
