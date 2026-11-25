@@ -1,35 +1,16 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GROUP_SIZE="${CODEXBAR_TEST_GROUP_SIZE:-12}"
-SUITE_TIMEOUT="${CODEXBAR_TEST_SUITE_TIMEOUT:-180}"
-RETRY_NON_TIMEOUT_FAILURES="${CODEXBAR_TEST_RETRY_NON_TIMEOUT_FAILURES:-1}"
-
-cd "${ROOT_DIR}"
-
-source "${ROOT_DIR}/Scripts/test_environment.sh"
-
-ARGS=(
-  --group-size "${GROUP_SIZE}"
-  --timeout "${SUITE_TIMEOUT}"
-)
-
-case "${RETRY_NON_TIMEOUT_FAILURES}" in
-  0) ARGS+=(--no-retry-non-timeout-failures) ;;
-  1) ;;
-  *)
-    echo "CODEXBAR_TEST_RETRY_NON_TIMEOUT_FAILURES must be 0 or 1" >&2
-    exit 2
-    ;;
-esac
-
-if [[ -n "${CODEXBAR_TEST_SHARD_INDEX:-}" || -n "${CODEXBAR_TEST_SHARD_COUNT:-}" ]]; then
-  ARGS+=(
-    --shard-index "${CODEXBAR_TEST_SHARD_INDEX:?CODEXBAR_TEST_SHARD_COUNT requires CODEXBAR_TEST_SHARD_INDEX}"
-    --shard-count "${CODEXBAR_TEST_SHARD_COUNT:?CODEXBAR_TEST_SHARD_INDEX requires CODEXBAR_TEST_SHARD_COUNT}"
-  )
+cd "$(dirname "$0")/.."
+mkdir -p .build/clang-cache
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-"$PWD/.build/clang-cache"}"
+developer="${DEVELOPER_DIR:-$(xcode-select -p)}"
+if [[ "$developer" == */CommandLineTools ]]; then
+    # Apple's standalone Command Line Tools ship Swift Testing outside the SDK.
+    frameworks="$developer/Library/Developer/Frameworks"
+    interop="$developer/Library/Developer/usr/lib"
+    swift test --disable-sandbox --disable-xctest --enable-swift-testing \
+        -Xswiftc -F -Xswiftc "$frameworks" -Xlinker -rpath -Xlinker "$frameworks" \
+        -Xlinker -rpath -Xlinker "$interop" "$@"
+else
+    swift test --disable-xctest --enable-swift-testing "$@"
 fi
-
-exec python3 "${ROOT_DIR}/Scripts/ci_swift_test_by_suite.py" "${ARGS[@]}" "$@"

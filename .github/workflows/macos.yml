@@ -1,0 +1,21 @@
+name: macOS
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile
+        run: swift build
+      - name: Test
+        run: ./Scripts/test.sh
+      - name: Format and lint
+        run: |
+          brew install swiftformat swiftlint
+          ./Scripts/lint.sh
+      - name: Package
+        run: ./Scripts/package.sh release
