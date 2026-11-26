@@ -1,226 +1,244 @@
 import Foundation
 
-struct PriceQuote: Sendable {
-    enum Basis: String {
-        case verifiedHistory, datedHistory, bundled, current
+/// USD per million tokens, for a single published Standard base-context schedule.
+struct TokenRates: Codable, Hashable, Sendable {
+    let input: Double
+    let cacheRead: Double
+    let cacheWrite: Double
+    let longWrite: Double
+    let output: Double
+
+    var values: [Double] {
+        [self.input, self.cacheRead, self.cacheWrite, self.longWrite, self.output]
     }
 
-    let usd: Double
-    let basis: Basis
+    var valid: Bool {
+        self.values.allSatisfy { (0...1_000_000).contains($0) }
+    }
+
+    func usd(_ counts: TokenCounts) -> Double {
+        (Double(counts.input) * self.input + Double(counts.cached) * self.cacheRead
+            + Double(counts.written - counts.longWrites) * self.cacheWrite
+            + Double(counts.longWrites) * self.longWrite + Double(counts.output) * self.output) / 1_000_000
+    }
 }
 
-struct CatalogProviders<Value: Decodable & Sendable>: Decodable, Sendable {
-    let openai: Value
-    let anthropic: Value
-
-    func value(for provider: ProviderInstanceID) -> Value? {
-        switch provider {
-        case .codex: self.openai
-        case .claude: self.anthropic
-        default: nil
-        }
-    }
-}
-
-struct CatalogRate: Decodable, Sendable {
-    struct Threshold: Decodable, Sendable {
-        let type: String
-        let size: Int
-    }
-
+private struct FeedRate: Decodable {
     let input: Double?
     let output: Double?
     let cacheRead: Double?
     let cacheWrite: Double?
     let cacheWrite1hMultiple: Double?
-    let above: Int?
-    let tier: Threshold?
-    let tiers: [Self]?
-    let regions: [String: Double]?
     let validFrom: Date?
-    let validFromBasis: String?
 
-    var contextThreshold: Int? {
-        self.above ?? (self.tier?.type == "context" ? self.tier?.size : nil)
-    }
-
-    var hasListPrice: Bool {
-        [self.input, self.output].allSatisfy { $0.map { $0.isFinite && $0 >= 0 } == true }
-    }
-
-    func cost(_ usage: RequestPricing, provider: ProviderInstanceID, correctLegacyContext: Bool = false) -> Double? {
-        guard self.hasListPrice else { return nil }
-        let counts = usage.tokens
-        let claude = provider == .claude
-        let context = usage.contextSize(for: provider)
-        let tier = self.tiers?.compactMap { rate -> (Int, Self)? in
-            guard let declared = rate.contextThreshold else { return nil }
-            let threshold = correctLegacyContext && declared == 200_000 ? 272_000 : declared
-            guard context > Decimal(threshold) else { return nil }
-            return (threshold, rate)
-        }.max { $0.0 < $1.0 }?.1
-        guard let input = tier?.input ?? self.input, let output = tier?.output ?? self.output else { return nil }
-        let read = tier?.cacheRead ?? self.cacheRead
-        let write = tier?.cacheWrite ?? self.cacheWrite
-        let longWrites = if claude {
-            min(usage.oneHour ?? 0, counts.written)
-        } else {
-            usage.codexCacheRetention == "12h" ? counts.written : 0
-        }
-        let shortWrites = counts.written - longWrites
-        let uncached = claude ? counts.input : counts.input - counts.cached - counts.written
-        guard uncached >= 0, shortWrites >= 0, longWrites >= 0,
-              counts.cached == 0 || read != nil, shortWrites == 0 || write != nil else { return nil }
-
-        let longMultiplier = tier?.cacheWrite1hMultiple ?? self.cacheWrite1hMultiple ?? (claude ? 2 : 2.5)
-        let region = usage.inferenceGeo.flatMap { self.regions?[$0] }
-            ?? (claude && usage.inferenceGeo == "us" ? 1.1 : 1)
-        guard [input, output, read ?? 0, write ?? 0, longMultiplier, region]
-            .allSatisfy({ $0.isFinite && $0 >= 0 }) else { return nil }
-        let perMillion = Double(uncached) * input + Double(counts.output) * output
-            + Double(counts.cached) * (read ?? 0) + Double(shortWrites) * (write ?? 0)
-            + Double(longWrites) * input * longMultiplier
-        let cost = perMillion * region / 1_000_000
-        return cost.isFinite && cost >= 0 ? cost : nil
+    func standard(for provider: ProviderInstanceID) -> TokenRates? {
+        guard let input = self.input, let output = self.output else { return nil }
+        let rates = TokenRates(
+            input: input, cacheRead: self.cacheRead ?? input * 0.1,
+            cacheWrite: self.cacheWrite ?? input * (provider == .claude ? 1.25 : 1),
+            longWrite: input * (self.cacheWrite1hMultiple ?? (provider == .claude ? 2 : 2.5)),
+            output: output)
+        return rates.valid ? rates : nil
     }
 }
 
-struct HistoricalCatalogEntry: Decodable, Sendable {
-    let start: Date?
-    let rates: CatalogRate?
-
-    var effective: Date? {
-        // The feed sometimes has a null start or attaches tool changes
-        // older than the model. Never extend its token price backwards.
-        if let published = self.rates?.validFrom { return max(self.start ?? published, published) }
-        return self.start
-    }
+private struct FeedProviders<Value: Decodable>: Decodable {
+    let openai: Value
+    let anthropic: Value
 }
 
-struct PricingAliases: Decodable, Sendable {
-    let models: [String: String]
-}
-
-struct CurrentCatalogModel: Decodable, Sendable {
-    struct Experimental: Decodable, Sendable {
-        let modes: [String: CurrentCatalogMode]?
+package struct ModelPriceCatalog: Codable, Sendable {
+    private struct Entry: Decodable {
+        let start: Date?
+        let rates: FeedRate?
     }
 
-    let canonicalModelId: String?
-    let cost: CatalogRate?
-    let experimental: Experimental?
-}
+    private struct Aliases: Decodable {
+        let models: [String: String]
+    }
 
-struct CurrentCatalogMode: Decodable, Sendable {
-    let cost: CatalogRate?
-}
-
-package struct ModelPriceCatalog: Sendable {
-    struct Historical: Decodable, Sendable {
+    private struct History: Decodable {
         let schema: Int
-        let prices: CatalogProviders<[String: [String: [HistoricalCatalogEntry]]]>
-        let aliases: PricingAliases
+        let prices: FeedProviders<[String: [String: [Entry]]]>
+        let aliases: Aliases?
     }
 
-    struct CurrentProvider: Decodable, Sendable {
-        let models: [String: CurrentCatalogModel]
+    private struct CurrentModel: Decodable {
+        let cost: FeedRate?
+        let canonicalModelId: String?
     }
 
-    /// models.dev used its legacy 200k field for these OpenAI models until #1755
-    /// introduced the original published 272k threshold on May 12.
-    /// https://github.com/anomalyco/models.dev/pull/1755
-    private static let contextSchemaFix = Date(timeIntervalSince1970: 1_778_625_648)
+    private struct Current: Decodable {
+        let models: [String: CurrentModel]
+    }
 
-    var historical: Historical?
-    var current: CatalogProviders<CurrentProvider>?
+    private var prices: [ProviderInstanceID: [String: Set<TokenRates>]] = [:]
+    private var aliases: [String: String] = [:]
 
-    package init(historicalData: Data? = nil, currentData: Data? = nil) {
+    package init() {}
+
+    init?(history: Data, now: Date = Date()) {
+        let decoder = Self.decoder()
+        guard let feed = try? decoder.decode(History.self, from: history), feed.schema == 2 else { return nil }
+        self.aliases = feed.aliases?.models ?? [:]
+        for (provider, models) in [(ProviderInstanceID.codex, feed.prices.openai), (.claude, feed.prices.anthropic)] {
+            for (model, modes) in models {
+                for entry in modes["standard"] ?? [] {
+                    guard let rates = entry.rates, let start = rates.validFrom ?? entry.start,
+                          max(start, entry.start ?? start) <= now,
+                          let rate = rates.standard(for: provider) else { continue }
+                    self.retain(rate, model: model, provider: provider)
+                }
+            }
+            guard self.prices[provider]?.isEmpty == false else { return nil }
+        }
+    }
+
+    init?(current: Data) {
+        guard let feed = try? Self.decoder().decode(FeedProviders<Current>.self, from: current) else { return nil }
+        for (provider, catalog) in [(ProviderInstanceID.codex, feed.openai), (.claude, feed.anthropic)] {
+            for (name, model) in catalog.models {
+                if let rate = (model.cost ?? model.canonicalModelId.flatMap { catalog.models[$0]?.cost })?
+                    .standard(for: provider)
+                {
+                    self.retain(rate, model: name, provider: provider)
+                }
+            }
+            guard self.prices[provider]?.isEmpty == false else { return nil }
+        }
+    }
+
+    private static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         decoder.dateDecodingStrategy = .iso8601
-        if let historicalData, let decoded = try? decoder.decode(Historical.self, from: historicalData),
-           decoded.schema == 2,
-           Self.containsRates(decoded.prices.openai), Self.containsRates(decoded.prices.anthropic)
-        {
-            self.historical = decoded
-        }
-        if let currentData, let decoded = try? decoder.decode(
-            CatalogProviders<CurrentProvider>.self,
-            from: currentData),
-            decoded.openai.models.values.contains(where: { $0.cost?.hasListPrice == true }),
-            decoded.anthropic.models.values.contains(where: { $0.cost?.hasListPrice == true })
-        {
-            self.current = decoded
-        }
+        return decoder
     }
 
-    private static func containsRates(_ models: [String: [String: [HistoricalCatalogEntry]]]) -> Bool {
-        models.values.contains { $0["standard"]?.contains { $0.rates?.hasListPrice == true } == true }
+    private mutating func retain(_ rate: TokenRates, model: String, provider: ProviderInstanceID) {
+        func dominates(_ lhs: TokenRates, _ rhs: TokenRates) -> Bool {
+            zip(lhs.values, rhs.values).allSatisfy { $0 >= $1 }
+        }
+        var schedules = self.prices[provider]?[model] ?? []
+        if schedules.contains(where: { dominates($0, rate) }) { return }
+        schedules = schedules.filter { !dominates(rate, $0) }
+        schedules.insert(rate)
+        self.prices[provider, default: [:]][model] = schedules
     }
 
-    func quote(_ usage: RequestPricing, provider: ProviderInstanceID) -> PriceQuote? {
-        guard let model = usage.model else { return nil }
-        let vendor = provider == .codex ? "openai" : "anthropic"
-        let normalized = provider == .codex
-            ? LedgerPricing.normalizeCodexModel(model) : LedgerPricing.normalizeClaudeModel(model)
-        let alias = self.historical?.aliases.models[model]
-        let prefix = vendor + "/"
-        let names = [
-            model,
-            alias.flatMap { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil },
-            normalized,
-        ]
-            .compactMap(\.self)
-        let mode = Self.mode(usage, provider: provider)
-        if let mode, let models = self.historical?.prices.value(for: provider) {
-            for name in names {
-                guard let timeline = models[name]?[mode],
-                      let entry = timeline.last(where: { $0.effective.map { $0 <= usage.date } == true })
-                else { continue }
-                // A dated withdrawal explicitly ends the catalog's price.
-                guard let rate = entry.rates else { return nil }
-                let legacyOpenAIContext = (normalized == "gpt-5.4" || normalized == "gpt-5.5")
-                    && rate.validFrom.map { $0 < Self.contextSchemaFix } == true
-                if let cost = rate.cost(usage, provider: provider, correctLegacyContext: legacyOpenAIContext) {
-                    let verified = rate.validFromBasis == "documented" || rate.validFromBasis == "scheduled"
-                    return PriceQuote(usd: cost, basis: verified ? .verifiedHistory : .datedHistory)
+    mutating func merge(_ catalog: Self) {
+        self.aliases.merge(catalog.aliases) { _, latest in latest }
+        for (provider, models) in catalog.prices {
+            for (model, schedules) in models {
+                for rate in schedules {
+                    self.retain(rate, model: model, provider: provider)
                 }
             }
         }
-        if let cost = usage.cost(for: provider) {
-            return PriceQuote(usd: cost, basis: .bundled)
-        }
-        guard let mode, let models = self.current?.value(for: provider)?.models else { return nil }
-        for name in names {
-            guard let model = models[name] else { continue }
-            let canonical = model.canonicalModelId.flatMap { models[$0] }
-            let base = model.cost ?? canonical?.cost
-            let rate = mode == "standard"
-                ? base : model.experimental?.modes?[mode]?.cost ?? canonical?.experimental?.modes?[mode]?.cost
-            // A mode with short-context rates alone does not establish a long-context rate.
-            if mode != "standard", rate?.tiers?.isEmpty != false,
-               let threshold = base?.tiers?.compactMap(\.contextThreshold).min(),
-               usage.contextSize(for: provider) > Decimal(threshold)
-            {
-                continue
-            }
-            if let cost = rate?.cost(usage, provider: provider) {
-                return PriceQuote(usd: cost, basis: .current)
-            }
-        }
-        return nil
     }
 
-    private static func mode(_ usage: RequestPricing, provider: ProviderInstanceID) -> String? {
-        if provider == .claude {
-            guard usage.tier == nil || usage.tier == "standard" || usage.tier == "batch" else { return nil }
-            if usage.tier == "batch" { return usage.speed == nil || usage.speed == "standard" ? "batch" : nil }
-            return usage.speed ?? "standard"
+    func canonical(_ name: String, provider: ProviderInstanceID) -> String {
+        let vendor = provider == .codex ? "openai/" : "anthropic/"
+        let raw = name.hasPrefix(vendor) ? String(name.dropFirst(vendor.count)) : name
+        if provider == .codex, Self.proxyModels.contains(raw) { return raw }
+        if let alias = self.aliases[raw], alias.hasPrefix(vendor) {
+            return String(alias.dropFirst(vendor.count))
         }
-        switch usage.tier {
-        case nil, "default", "standard": return "standard"
-        case "priority": return "fast"
-        default: return usage.tier
+        if let suffix = raw.range(of: #"-\d{4}-\d{2}-\d{2}$|-\d{8}$"#, options: .regularExpression) {
+            let base = String(raw[..<suffix.lowerBound])
+            if self.prices[provider]?[base] != nil || Self.bootstrap[base] != nil { return base }
+        }
+        return raw
+    }
+
+    func premium(_ model: String, provider: ProviderInstanceID, counts: TokenCounts) -> TokenRates? {
+        let canonical = self.canonical(model, provider: provider)
+        var rates = self.prices[provider]?[canonical] ?? []
+        rates.formUnion(self.prices[provider]?[model] ?? [])
+        if let rate = Self.bootstrap[canonical] { rates.insert(rate) }
+        return rates.filter(\.valid).max {
+            let left = $0.usd(counts)
+            let right = $1.usd(counts)
+            if left != right { return left < right }
+            return $0.values.lexicographicallyPrecedes($1.values)
         }
     }
+
+    struct Representative {
+        let model: String
+        let tokens: Int
+        let rates: TokenRates?
+    }
+
+    struct Estimate {
+        let representatives: [Representative]
+        let usd: Double?
+        let proxyTokens: Int
+        let partial: Bool
+    }
+
+    func estimate(_ summary: UsageSummary, provider: ProviderInstanceID) -> Estimate {
+        var models: [String: TokenCounts] = [:]
+        for (name, counts) in summary.models where counts.total > 0 {
+            let name = self.canonical(name, provider: provider)
+            models[name, default: .init()] += counts
+        }
+        let ranked = models.keys.filter { !$0.isEmpty }.sorted {
+            let left = models[$0]?.total ?? 0
+            let right = models[$1]?.total ?? 0
+            return left == right ? $0 < $1 : left > right
+        }
+        let priced = models.reduce(into: [String: TokenRates]()) { rates, item in
+            rates[item.key] = self.premium(item.key, provider: provider, counts: item.value)
+        }
+        let codex = provider == .codex
+        let unpricedCounts = models.reduce(into: TokenCounts()) { sum, item in
+            if priced[item.key] == nil { sum += item.value }
+        }
+        let proxy = codex ? self.premium("gpt-6-astra", provider: provider, counts: unpricedCounts) : nil
+        let top = ranked.prefix(2).map { model in
+            Representative(model: model, tokens: models[model]?.total ?? 0, rates: priced[model] ?? proxy)
+        }
+        let weighted = top.compactMap { item in item.rates.map { (Double(item.tokens), $0) } }
+        let weight = weighted.reduce(0) { $0 + $1.0 }
+        var usd = 0.0
+        var valued = 0
+        var proxyTokens = 0
+        for (model, counts) in models {
+            if codex, priced[model] == nil, let proxy {
+                usd += proxy.usd(counts)
+                proxyTokens += counts.total
+            } else if top.contains(where: { $0.model == model }), let rate = priced[model] {
+                usd += rate.usd(counts)
+            } else if weight > 0 {
+                usd += weighted.reduce(0) { $0 + $1.0 * $1.1.usd(counts) } / weight
+            } else if let rate = priced[model] {
+                usd += rate.usd(counts)
+            } else {
+                continue
+            }
+            valued += counts.total
+        }
+        // Historical records with only a total inherit the observed provider's average value per token.
+        if valued > 0 { usd += Double(summary.opaque) * usd / Double(valued) }
+        return Estimate(
+            representatives: top,
+            usd: valued > 0 ? usd : nil,
+            proxyTokens: proxyTokens,
+            partial: summary.total > valued + (valued > 0 ? summary.opaque : 0))
+    }
+
+    // Public launch schedules keep fresh/offline installs useful while the public feed is unavailable.
+    // https://developers.openai.com/api/docs/pricing
+    // https://platform.claude.com/docs/en/about-claude/pricing
+    private static let proxyModels = ["codex-auto-review", "gpt-reserve"]
+    private static let bootstrap: [String: TokenRates] = [
+        "gpt-5.4": .init(input: 2.5, cacheRead: 0.25, cacheWrite: 2.5, longWrite: 6.25, output: 15),
+        "gpt-5.5": .init(input: 5, cacheRead: 0.5, cacheWrite: 5, longWrite: 12.5, output: 30),
+        "gpt-6.1-sol": .init(input: 2, cacheRead: 0.1, cacheWrite: 2.5, longWrite: 5, output: 10),
+        "gpt-6-astra": .init(input: 10, cacheRead: 1, cacheWrite: 12.5, longWrite: 25, output: 50),
+        "claude-opus-5-5": .init(input: 4, cacheRead: 0.2, cacheWrite: 5, longWrite: 8, output: 20),
+        "claude-fable-5-2": .init(input: 8, cacheRead: 0.2, cacheWrite: 10, longWrite: 16, output: 40),
+        "claude-sonnet-4-6": .init(input: 3, cacheRead: 0.3, cacheWrite: 3.75, longWrite: 6, output: 15),
+    ]
 }

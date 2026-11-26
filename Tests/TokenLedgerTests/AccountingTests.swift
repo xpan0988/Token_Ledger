@@ -5,136 +5,182 @@ import Testing
 struct AccountingTests {
     private let timestamp = "2026-11-10T12:00:00Z"
 
-    private func line(_ values: [String: Any]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys])
-    }
-
-    private func count(_ input: Int, _ cached: Int, _ output: Int) -> [String: Int] {
+    private func count(_ input: Int, _ cached: Int = 0, _ output: Int = 0) -> [String: Int] {
         ["input_tokens": input, "cached_input_tokens": cached, "output_tokens": output]
     }
 
-    private func entry(_ type: String, _ payload: [String: Any], timestamp: String? = nil) throws -> Data {
-        try self.line(["type": type, "timestamp": timestamp ?? self.timestamp, "payload": payload])
+    private func entry(_ type: String, _ payload: [String: Any], _ offset: Int = 0) -> [String: Any] {
+        ["type": type, "timestamp": "2026-11-10T12:00:\(String(format: "%02d", offset))Z", "payload": payload]
     }
 
-    @Test
-    func `codex typed and legacy views of one request count once across file copies`() throws {
-        var ledger = LedgerState(timeZone: "UTC")
-        let usage = self.count(100, 40, 10)
-        let prefix = try self.entry("session_meta", ["id": "session", "model_provider": "openai"])
-        let context = try self.entry("turn_context", ["model": "gpt-5.4"])
-        let legacy = try self.entry("event_msg", ["type": "token_count", "info": [
-            "total_token_usage": usage, "last_token_usage": usage,
-        ]])
-        let typed = try self.entry("token_usage_record", [
-            "thread_id": "session",
-            "response_id": "response",
-            "usage": usage,
-            "thread_token_usage": usage,
-        ])
-        for rows in [[prefix, context, legacy, typed], [prefix, context, typed, legacy]] {
-            var scanner = TranscriptState()
-            for row in rows {
-                if let observation = scanner.consume(row, provider: .codex) {
-                    ledger.record(observation, provider: .codex)
-                }
-            }
+    private func append(_ rows: [[String: Any]], to file: URL) throws {
+        var data = Data()
+        for row in rows {
+            try data.append(JSONSerialization.data(withJSONObject: row))
+            data.append(0x0A)
         }
-        let persisted = try JSONEncoder().encode(ledger)
-        let encoded = try #require(String(bytes: persisted, encoding: .utf8))
-        #expect(!encoded.contains("\"cost\""))
-        let restored = try JSONDecoder().decode(LedgerState.self, from: persisted)
-        #expect(restored.events.count == 1)
-        #expect(restored.totals(stale: false, partial: false).totalTokens == 110)
-        let cost = try #require(restored.totals(stale: false, partial: false).apiCosts.first).value
-        #expect(abs(NSDecimalNumber(decimal: cost).doubleValue - 0.00031) < 1e-12)
+        if FileManager.default.fileExists(atPath: file.path) {
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } else {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try data.write(to: file)
+        }
+    }
+
+    private func modern(_ id: String, _ usage: Int, _ cumulative: Int, _ offset: Int, thread: String = "thread")
+        -> [String: Any]
+    {
+        self.entry("token_usage_record", [
+            "thread_id": thread, "response_id": id, "model": "gpt-5.5",
+            "usage": self.count(usage, usage / 2), "thread_token_usage": self.count(cumulative, cumulative / 2),
+        ], offset)
+    }
+
+    private func legacy(_ last: Int, _ cumulative: Int, _ offset: Int) -> [String: Any] {
+        self.entry("event_msg", ["type": "token_count", "info": [
+            "total_token_usage": self.count(cumulative, cumulative / 2), "last_token_usage": self.count(last, last / 2),
+        ]], offset)
     }
 
     @Test
-    func `ambiguous legacy mirrors do not add a second aggregate copy`() throws {
-        var ledger = LedgerState(timeZone: "UTC")
-        let now = try #require(TranscriptState.date(self.timestamp))
-        ledger.record(.init(identity: "weak", date: now, tokens: 40, authoritative: false), provider: .codex)
-        ledger.record(.init(
-            identity: "response1",
-            alias: "weak",
-            date: now,
-            tokens: 40,
-            authoritative: true), provider: .codex)
-        ledger.record(.init(
-            identity: "response2",
-            alias: "weak",
-            date: now,
-            tokens: 50,
-            authoritative: true), provider: .codex)
-        ledger.record(.init(identity: "weak", date: now, tokens: 40, authoritative: false), provider: .codex)
-        #expect(ledger.totals(stale: false, partial: false).totalTokens == 90)
-        #expect(ledger.totals(stale: false, partial: false).tokenCoverageIsPartial)
+    func `mixed Codex counters with drift choose one stream and preserve resets and child usage`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sessions/thread.jsonl")
+        try self.append([
+            self.entry("session_meta", ["id": "thread"]),
+            self.entry("turn_context", ["model": "gpt-5.5"]),
+            self.legacy(100, 100, 1), self.modern("first", 100, 100, 2),
+            self.modern("aux", 50, 150, 3),
+            self.legacy(200, 300, 4), self.modern("next", 200, 350, 5),
+            self.modern("reset", 50, 50, 6), self.legacy(50, 50, 7),
+        ], to: source)
+        try self.append([
+            self.entry("session_meta", ["id": "child", "source": ["subagent": "thread_spawn"]]),
+            self.entry("turn_context", ["model": "gpt-5.5"]), self.legacy(20, 20, 1),
+            self.legacy(20, 20, 2), self.legacy(30, 50, 3), self.legacy(20, 20, 4),
+        ], to: root.appendingPathComponent("sessions/child.jsonl"))
+        let locations = UsageLocations(codex: root, claude: root)
+        let file = root.appendingPathComponent("history.sqlite")
+        let collector = HistoryCollector(file: file, locations: locations)
+        let first = await collector.collect([.codex])
+        #expect(first.totals.totalTokens == 470)
+        #expect(!first.persistenceFailed)
+
+        let archive = root.appendingPathComponent("archived_sessions/copy.jsonl")
+        try FileManager.default.createDirectory(
+            at: archive.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: source, to: archive)
+        try self.append([self.modern("resumed", 120, 100_000, 9)], to: source)
+        let reopened = HistoryCollector(file: file, locations: locations)
+        #expect(await reopened.collect([.codex]).totals.totalTokens == 590)
+        try FileManager.default.removeItem(at: source.deletingLastPathComponent())
+        try FileManager.default.removeItem(at: archive.deletingLastPathComponent())
+        #expect(await HistoryCollector(file: file, locations: locations).collect([]).totals.totalTokens == 590)
     }
 
     @Test
-    func `fork legacy counters cannot re-add a parent balance`() throws {
-        var scanner = TranscriptState()
-        _ = try scanner.consume(
-            self.entry("session_meta", ["id": "child", "forked_from_id": "parent"]),
-            provider: .codex)
-        let row = try self.entry("event_msg", ["type": "token_count", "info": [
-            "total_token_usage": self.count(100, 20, 10), "last_token_usage": self.count(100, 20, 10),
-        ]])
-        #expect(scanner.consume(row, provider: .codex) == nil)
-        #expect(scanner.partial)
+    func `legacy prefix survives only when the modern cumulative counter proves continuation`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("sessions/thread.jsonl")
+        let file = root.appendingPathComponent("history.sqlite")
+        let collector = HistoryCollector(file: file, locations: .init(codex: root, claude: root))
+        try self.append([self.entry("session_meta", ["id": "thread"]), self.legacy(30, 30, 1)], to: source)
+        #expect(await collector.collect([.codex]).totals.totalTokens == 30)
+        try self.append([self.modern("next", 70, 100, 2), self.legacy(70, 100, 3)], to: source)
+        #expect(await collector.collect([.codex]).totals.totalTokens == 100)
+        let fork = root.appendingPathComponent("sessions/fork.jsonl")
+        try self.append([
+            self.entry("session_meta", ["id": "fork", "forked_from_id": "thread"]),
+            self.legacy(100, 100, 1), self.legacy(20, 120, 2),
+        ], to: fork)
+        #expect(await collector.collect([.codex]).totals.totalTokens == 120)
+        let cutoff = try #require(TranscriptState.date("2026-11-10T12:00:04Z"))
+        #expect(await collector.delete(through: cutoff))
+        try self.append([self.modern("after", 40, 140, 5)], to: source)
+        #expect(await collector.collect([.codex]).totals.totalTokens == 40)
     }
 
     @Test
-    func `claude stream fragments merge and cached categories remain disjoint`() throws {
-        var scanner = TranscriptState()
-        var ledger = LedgerState(timeZone: "UTC")
-        for output in [1, 20, 11] {
-            let row = try self.line([
-                "type": "assistant", "requestId": "req", "timestamp": self.timestamp,
+    func `claude streamed fragments and copied logs preserve disjoint cache categories`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("history.sqlite")
+        let locations = UsageLocations(codex: root, claude: root)
+        let source = root.appendingPathComponent("projects/session.jsonl")
+        func row(_ output: Int, request: String? = "req") -> [String: Any] {
+            var row: [String: Any] = [
+                "type": "assistant", "timestamp": self.timestamp,
                 "message": ["id": "msg", "model": "claude-sonnet-4-6", "usage": [
                     "input_tokens": 100, "output_tokens": output, "cache_read_input_tokens": 200,
                     "cache_creation_input_tokens": 50, "cache_creation": ["ephemeral_1h_input_tokens": 10],
                 ]],
-            ])
-            let observation = scanner.consume(row, provider: .claude)
-            let event = try #require(observation)
-            ledger.record(event, provider: .claude)
+            ]
+            row["requestId"] = request
+            return row
         }
-        let totals = ledger.totals(stale: false, partial: false)
+        let collector = HistoryCollector(file: file, locations: locations)
+        try self.append([row(1, request: nil), row(20), row(11)], to: source)
+        let totals = await collector.collect([.claude]).totals
         #expect(totals.totalTokens == 370)
         let cost = try #require(totals.apiCosts.first).value
         #expect(abs(NSDecimalNumber(decimal: cost).doubleValue - 0.00087) < 1e-12)
+        let copy = source.deletingLastPathComponent().appendingPathComponent("copy.jsonl")
+        try self.append([row(30, request: nil), row(20), row(21)], to: copy)
+        let reload = HistoryCollector(file: file, locations: locations)
+        #expect(await reload.collect([.claude]).totals.totalTokens == 371)
+        try self.append([row(5, request: "different")], to: source)
+        #expect(await reload.collect([.claude]).totals.totalTokens == 726)
     }
 
     @Test
-    func `dated migration combines disjoint days and takes a lower bound for an overlapping day`() throws {
-        var ledger = LedgerState(timeZone: "UTC")
-        ledger.legacyDays[.codex] = [
-            "2026-11-08": HistoryBucket(tokens: 5_000_000_000),
-            "2026-11-10": HistoryBucket(tokens: 800),
-        ]
-        ledger.legacyUndated[.codex] = HistoryBucket(tokens: 5_000_000_900)
-        let now = try #require(TranscriptState.date(self.timestamp))
-        let pricing = RequestPricing(
-            date: now, model: "gpt-5.4", tokens: .init(input: 1200, cached: 0, written: 0, output: 0))
-        ledger.record(
-            .init(identity: "new", date: now, tokens: 1200, pricing: pricing, authoritative: true),
-            provider: .codex)
-        ledger.record(.init(
-            identity: "next",
-            date: now.addingTimeInterval(86400),
-            tokens: 210,
-            authoritative: true), provider: .codex)
-        let result = ledger.totals(stale: false, partial: false)
-        #expect(result.totalTokens == 5_000_001_410)
-        #expect(result.tokenCoverageIsPartial)
-        #expect(result.apiCosts.first?.value == Decimal(string: "0.003"))
-        #expect(result.priceCoverageIsPartial)
+    func `migration backs up v1 and retains unmatched recorded usage without importing legacy mirrors`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldFile = root.appendingPathComponent("history.json")
+        let backup = root.appendingPathComponent("history-v1.backup.json")
+        let file = root.appendingPathComponent("history.sqlite")
+        let source = root.appendingPathComponent("sessions/thread.jsonl")
+        try self.append([
+            self.entry("session_meta", ["id": "thread"]), self.legacy(100, 200, 1),
+            self.modern("retained", 100, 100, 2),
+        ], to: source)
+        let data = try JSONSerialization.data(withJSONObject: [
+            "timeZone": "UTC",
+            "events": [
+                LedgerIdentity.hash("codex-response:retained"): [
+                    "provider": "codex", "day": "2026-11-10", "tokens": 100, "authoritative": true,
+                ],
+                LedgerIdentity.hash("codex-token-count:thread:200:100:0"): [
+                    "provider": "codex", "day": "2026-11-10", "tokens": 100, "authoritative": false,
+                ],
+                LedgerIdentity.hash("codex-response:rotated"): [
+                    "provider": "codex", "day": "2026-11-09", "tokens": 250, "authoritative": true,
+                ],
+            ],
+            "observedProviders": ["codex"], "legacyDays": [], "legacyUndated": [],
+        ])
+        try data.write(to: oldFile)
+        let locations = UsageLocations(codex: root, claude: root)
+        let collector = HistoryCollector(file: file, locations: locations)
+        #expect(await collector.collect([]).totals.totalTokens == 450)
+        #expect(await collector.collect([.codex]).totals.totalTokens == 350)
+        #expect(try Data(contentsOf: backup) == data)
+        #expect(!FileManager.default.fileExists(atPath: oldFile.path))
+        try self.append([self.modern("rotated", 250, 350, 3)], to: source)
+        let reopened = HistoryCollector(file: file, locations: locations)
+        #expect(await reopened.collect([.codex]).totals.totalTokens == 350)
     }
 
     @Test
-    func `legacy checkpoint migration is read-only and persists independently`() async throws {
+    func `embedded history imports existing day and session totals once`() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -142,134 +188,22 @@ struct AccountingTests {
         let snapshot = Data(#"""
         {
             "sources":[{"provider":"codex","currency":"USD","fingerprint":"abc"}, {
-                "days":{"2026-11-08":{"tokens":5000000000,"cost":10}},
-                "sessions":{"hash":{"tokens":5000000020,"cost":11}},
+                "days":{"2026-11-08":{"tokens":5000000000}},
+                "sessions":{"hash":{"tokens":5000000020}},
                 "hasConfirmedEmpty":false,"partialTokens":false,"partialPrices":false,"ambiguousRotation":true
             }],
             "selected":["codex",[{"provider":"codex","currency":"USD","fingerprint":"abc"}]]
         }
         """#.utf8)
         try snapshot.write(to: legacyFile)
-        let file = root.appendingPathComponent("standalone.json")
-        let locations = UsageLocations(codex: root.appendingPathComponent("codex"), claude: root)
-        let migrated = HistoryCollector(file: file, locations: locations, legacyFile: legacyFile, legacyZone: "UTC")
-        let result = await migrated.collect([])
+        let file = root.appendingPathComponent("history.sqlite")
+        let locations = UsageLocations(codex: root, claude: root)
+        let collector = HistoryCollector(file: file, locations: locations, legacyFile: legacyFile, legacyZone: "UTC")
+        let result = await collector.collect([])
         #expect(result.totals.totalTokens == 5_000_000_020)
-        #expect(result.totals.apiCosts.isEmpty)
         #expect(result.totals.tokenCoverageIsPartial)
         #expect(result.totals.priceCoverageIsPartial)
-        #expect(!result.persistenceFailed)
-        let original = try Data(contentsOf: legacyFile)
-        #expect(original == snapshot)
-
-        let reloaded = HistoryCollector(file: file, locations: locations)
-        #expect(await reloaded.collect([]).totals == result.totals)
-    }
-
-    @Test
-    func `frozen event prices are discarded and matching originals supply pricing inputs once`() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let sessions = root.appendingPathComponent("sessions")
-        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let history = root.appendingPathComponent("history.json")
-        let source = sessions.appendingPathComponent("original.jsonl")
-        let usage = self.count(100, 40, 10)
-        let rows = try [
-            self.entry("session_meta", ["id": "session"]),
-            self.entry("turn_context", ["model": "gpt-5.4"]),
-            self.entry("token_usage_record", [
-                "thread_id": "session", "response_id": "retained", "usage": usage, "thread_token_usage": usage,
-            ]),
-        ]
-        try rows.reduce(into: Data()) { $0.append($1); $0.append(0x0A) }.write(to: source)
-        let old = try self.line([
-            "timeZone": "UTC",
-            "events": [
-                LedgerIdentity.hash("codex-response:retained"): [
-                    "provider": "codex", "day": "2026-11-10", "tokens": 110, "cost": 100, "authoritative": true,
-                ],
-                "rotated": [
-                    "provider": "codex", "day": "2026-11-09", "tokens": 250, "cost": 999, "authoritative": true,
-                ],
-            ],
-            "aliases": [:], "ambiguousAliases": [], "cursors": [:], "partialProviders": [],
-            "observedProviders": ["codex"], "legacyDays": [], "legacyUndated": [],
-        ])
-        try old.write(to: history)
-        let locations = UsageLocations(codex: root, claude: root)
-        let collector = HistoryCollector(file: history, locations: locations)
-        let result = await collector.collect([.codex])
-        #expect(result.totals.totalTokens == 360)
-        #expect(result.totals.priceCoverageIsPartial)
-        let amount = try #require(result.totals.apiCosts.first).value
-        #expect(abs(NSDecimalNumber(decimal: amount).doubleValue - 0.00031) < 1e-12)
-        let reloaded = HistoryCollector(file: history, locations: locations)
-        let withoutReplay = await reloaded.collect([.codex])
-        #expect(withoutReplay.totals == result.totals)
-    }
-
-    @Test
-    func `historical price cuts use the timestamp and Haiku uses the full prompt`() throws {
-        let million = TokenCounts(input: 0, cached: 1_000_000, written: 0, output: 0)
-        let before = try #require(TranscriptState.date("2026-10-06T23:59:59Z"))
-        let after = try #require(TranscriptState.date("2026-10-07T00:00:00Z"))
-        #expect(LedgerPricing.claudeCost(model: "claude-sonnet-5-5", tokens: million, oneHour: 0, date: before) == 0.20)
-        #expect(LedgerPricing.claudeCost(model: "claude-sonnet-5-5", tokens: million, oneHour: 0, date: after) == 0.10)
-        let long = TokenCounts(input: 1, cached: 100_000, written: 0, output: 100)
-        let haiku = try #require(LedgerPricing.claudeCost(
-            model: "claude-haiku-5-5",
-            tokens: long,
-            oneHour: 0,
-            date: after))
-        #expect(abs(haiku - 0.0052505) < 1e-12)
-        let request = TokenCounts(input: 1000, cached: 500, written: 0, output: 100)
-        let july = try #require(TranscriptState.date("2026-07-29T23:59:59Z"))
-        let august = try #require(TranscriptState.date("2026-08-20T23:59:59Z"))
-        for (model, oldDate, oldPrice, newPrice) in [
-            ("gpt-5.6-terra", july, 0.002875, 0.0023),
-            ("gpt-5.6-luna", july, 0.00115, 0.00023),
-            ("gpt-5.6-sol", august, 0.00575, 0.0042),
-        ] {
-            let old = try #require(LedgerPricing.codexCost(model: model, tokens: request, date: oldDate, tier: nil))
-            let newDate = oldDate.addingTimeInterval(1)
-            let new = try #require(LedgerPricing.codexCost(model: model, tokens: request, date: newDate, tier: nil))
-            #expect(abs(old - oldPrice) < 1e-12)
-            #expect(abs(new - newPrice) < 1e-12)
-        }
-    }
-
-    @Test
-    func `provider restart, log rotation, disable and deletion preserve the intended boundary`() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let codex = root.appendingPathComponent("codex")
-        let claude = root.appendingPathComponent("claude")
-        let sessions = codex.appendingPathComponent("sessions")
-        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
-        let source = sessions.appendingPathComponent("a.jsonl")
-        let file = root.appendingPathComponent("history.json")
-        let locations = UsageLocations(codex: codex, claude: claude)
-        let prefix = try self.entry("session_meta", ["id": "session"])
-        let context = try self.entry("turn_context", ["model": "gpt-5.4"])
-        let usage = self.count(75, 10, 25)
-        let first = try self.entry("token_usage_record", [
-            "thread_id": "session",
-            "response_id": "a",
-            "usage": usage,
-            "thread_token_usage": usage,
-        ])
-        try [prefix, context, first].reduce(into: Data()) { $0.append($1); $0.append(0x0A) }.write(to: source)
-        let collector = HistoryCollector(file: file, locations: locations)
-        #expect(await collector.collect([.codex]).totals.totalTokens == 100)
-        try FileManager.default.moveItem(at: source, to: sessions.appendingPathComponent("renamed.jsonl"))
-        let reload = HistoryCollector(file: file, locations: locations)
-        #expect(await reload.collect([]).totals.totalTokens == 100)
-        #expect(await reload.collect([.codex]).totals.totalTokens == 100)
-        let cutoff = try #require(TranscriptState.date(self.timestamp))
-        #expect(await reload.delete(through: cutoff))
-        try FileManager.default.copyItem(at: sessions.appendingPathComponent("renamed.jsonl"), to: source)
-        #expect(await reload.collect([.codex]).totals.totalTokens == nil)
-        #expect(FileManager.default.fileExists(atPath: source.path))
+        #expect(try Data(contentsOf: legacyFile) == snapshot)
+        #expect(await HistoryCollector(file: file, locations: locations).collect([]).totals == result.totals)
     }
 }

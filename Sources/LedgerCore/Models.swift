@@ -75,14 +75,19 @@ package struct TokenLedgerTotals: Sendable, Equatable {
     package var apiCosts: [TokenLedgerAmount] = []
     package var tokenCoverageIsPartial = false
     package var priceCoverageIsPartial = false
-    package var usesCurrentPriceEstimate = false
-    package var unknownPricingModels: Set<String> = []
     package var stale = false
 
     package init() {}
 
     package var totalTokens: Decimal? {
         self.tokens.isEmpty ? nil : self.tokens.values.reduce(0, +)
+    }
+
+    package func displayTokens(codexLifetime: Int64?) -> Decimal? {
+        guard let codexLifetime else { return self.totalTokens }
+        var display = self.tokens
+        display[.codex] = Decimal(codexLifetime)
+        return display.values.reduce(0, +)
     }
 }
 

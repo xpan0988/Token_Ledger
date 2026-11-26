@@ -33,12 +33,13 @@
 "ledger.noReset" = "重置时间暂不可用";
 "ledger.unavailable" = "暂不可用";
 "ledger.recordedOnly" = "从可访问的本地服务商日志记录的累计用量。";
-"ledger.partialTokens" = "部分 Token 历史暂不可用，合计仅涵盖已记录数据。";
-"ledger.partialCost" = "部分已记录用量缺少可用的 API 标价。";
-"ledger.currentPriceEstimate" = "部分请求缺少历史价格，按当前 API 标价估算。";
+"ledger.profileTokens" = "Codex 使用当前账户个人资料中的累计用量。Claude 和分布条使用本地日志。";
+"ledger.cachedProfileTokens" = "正在显示此账户最近一次获取的 Codex 个人资料累计用量。";
+"ledger.partialTokens" = "部分本地 Token 历史暂不可用。";
+"ledger.partialCost" = "部分已记录用量无法估价。";
 "ledger.lastKnown" = "最近一次可用数据";
 "ledger.persistenceFailed" = "最新历史记录未能保存到本机。";
-"ledger.estimateOnly" = "按 API 标价估算的金额。";
+"ledger.estimateOnly" = "按各服务商本地使用量最高的两个模型的历史高位标准 API 费率估算替代成本。";
 "ledger.includesEstimates" = "包含估算的订阅付款。";
 "ledger.noConversion" = "当前显示币种的汇率暂不可用。";
 "ledger.rateDate" = "ExchangeRate-API 汇率获取于 %@";
@@ -65,4 +66,4 @@
 "ledger.loginFailure" = "无法更改开机启动设置。";
 "ledger.loginApproval" = "请在系统设置 → 登录项中批准 Token 账本。";
 "ledger.deleteHistory" = "删除已记录用量…";
-"ledger.deleteHistoryHelp" = "清除 Token 账本中已记录的用量。服务商日志和订阅付款记录将保留。";
+"ledger.deleteHistoryHelp" = "清除 Token 账本中的本地用量历史。Codex 个人资料用量、服务商日志和订阅付款记录将保留。";

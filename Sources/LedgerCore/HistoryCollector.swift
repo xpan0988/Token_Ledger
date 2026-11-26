@@ -5,6 +5,8 @@ struct TranscriptCursor: Codable {
     var fileID: UInt64
     var offset: UInt64 = 0
     var modified: Date?
+    var size: UInt64?
+    var complete = false
     var anchor: Data?
     var discardingLine = false
     var parser = TranscriptState()
@@ -44,17 +46,28 @@ package actor HistoryCollector {
         package let persistenceFailed: Bool
     }
 
+    private struct Scan {
+        let provider: ProviderInstanceID
+        let store: UsageStore
+        let migrating: Bool
+        var remaining: Int
+        let deadline: ContinuousClock.Instant
+    }
+
     private let file: URL
     private let legacyFile: URL?
     private let legacyZone: String?
     private let locations: UsageLocations
+    private var store: UsageStore?
     private var state: LedgerState?
-    private var unreadable = false
-    private var dirty = false
+    private var backup: URL?
+    private var preview: [ProviderInstanceID: UsageSummary] = [:]
+    private var previewed: Set<ProviderInstanceID> = []
     private var inventory: [ProviderInstanceID: [URL]] = [:]
     private var nextFile: [ProviderInstanceID: Int] = [:]
     private var enabled: Set<ProviderInstanceID> = []
     private var prices = ModelPriceCatalog()
+    private var lastPartial = false
 
     package init(file: URL, locations: UsageLocations, legacyFile: URL? = nil, legacyZone: String? = nil) {
         self.file = file
@@ -63,61 +76,119 @@ package actor HistoryCollector {
         self.legacyZone = legacyZone
     }
 
-    package func updatePricing(_ prices: ModelPriceCatalog) {
+    @discardableResult
+    package func updatePricing(_ prices: ModelPriceCatalog) -> TokenLedgerTotals? {
         self.prices = prices
+        return self.state.map { self.totals($0, enabled: self.enabled, partial: self.lastPartial) }
     }
 
     package func collect(_ enabled: Set<ProviderInstanceID>) -> Result {
-        var state = self.state ?? self.load()
-        if self.inventory.isEmpty || self.enabled != enabled {
-            self.enabled = enabled
-            self.inventory = [:]
-            self.nextFile = [:]
-            for provider in enabled.sorted() {
-                self.inventory[provider] = self.files(provider)
-            }
-        }
-        let deadline = ContinuousClock.now + .seconds(2)
-        var remaining = 64 * 1024 * 1024
         var pending = false
-        for provider in enabled.sorted() {
-            let files = self.inventory[provider] ?? []
-            var index = self.nextFile[provider] ?? 0
-            while files.indices.contains(index), remaining > 0, ContinuousClock.now < deadline {
-                let outcome = self.read(
-                    file: files[index],
-                    provider: provider,
-                    state: &state,
-                    budget: &remaining,
-                    deadline: deadline)
-                if !outcome { break }
-                index += 1
+        var failed = false
+        do {
+            let store = try self.open()
+            if self.inventory.isEmpty || self.enabled != enabled {
+                self.enabled = enabled
+                self.inventory = [:]
+                self.nextFile = [:]
+                for provider in enabled.sorted() {
+                    self.inventory[provider] = self.files(provider)
+                }
             }
-            self.nextFile[provider] = index
-            pending = pending || index < files.count
+            var nextFile = self.nextFile
+            let deadline = ContinuousClock.now + .seconds(2)
+            var remaining = 64 * 1024 * 1024
+            let state = try store.transaction { store in
+                var state = try store.load(LedgerState.self, .summary, "totals") ?? .init()
+                var changed = false
+                var completed = Set<ProviderInstanceID>()
+                for provider in enabled.sorted() {
+                    let files = self.inventory[provider] ?? []
+                    var index = nextFile[provider] ?? 0
+                    let migrating = self.backup != nil && !state.reconciled.contains(provider)
+                    var scan = Scan(
+                        provider: provider,
+                        store: store,
+                        migrating: migrating,
+                        remaining: remaining,
+                        deadline: deadline)
+                    while files.indices.contains(index), scan.remaining > 0, ContinuousClock.now < deadline {
+                        let outcome = try autoreleasepool {
+                            try self.read(file: files[index], state: &state, scan: &scan)
+                        }
+                        changed = changed || outcome.changed
+                        if !outcome.ended { break }
+                        index += 1
+                    }
+                    remaining = scan.remaining
+                    if migrating, index == files.count { completed.insert(provider) }
+                    nextFile[provider] = index
+                    pending = pending || index < files.count
+                }
+                if let backup = self.backup, !completed.isEmpty {
+                    try autoreleasepool {
+                        let original = try self.priorLedger(PriorLedger.self, backup)
+                        for provider in completed {
+                            try original.reconcile(provider, into: &state, store: store)
+                        }
+                    }
+                    if state.reconciled.isSuperset(of: ProviderInstanceID.supported) {
+                        try store.clear(.migration)
+                    }
+                    changed = true
+                }
+                if changed { try store.save(state, .summary, "totals") }
+                return state
+            }
+            self.state = state
+            self.nextFile = nextFile
+            if !pending {
+                self.inventory = [:]
+                self.nextFile = [:]
+            }
+            let disabled = Set(ProviderInstanceID.supported).subtracting(enabled).subtracting(state.reconciled)
+            if let backup = self.backup, !disabled.isSubset(of: self.previewed) {
+                self
+                    .preview = try autoreleasepool {
+                        try self.priorLedger(PriorLedger.self, backup).preview(for: disabled)
+                    }
+                self.previewed = disabled
+            }
+        } catch {
+            failed = true
         }
-        if !pending {
-            self.inventory = [:]
-            self.nextFile = [:]
-        }
-        self.state = state
-        let failed = !self.saveIfNeeded(state)
-        let missing = !Set(state.events.values.map(\.provider)).union(state.observedProviders).isSuperset(of: enabled)
-        return Result(
-            totals: state.totals(stale: enabled.isEmpty, partial: pending || missing, prices: self.prices),
-            pending: pending,
-            persistenceFailed: failed)
+        self.lastPartial = pending || failed
+        let totals = self.totals(self.state ?? LedgerState(), enabled: enabled, partial: self.lastPartial)
+        return Result(totals: totals, pending: pending && !failed, persistenceFailed: failed)
+    }
+
+    private func totals(_ state: LedgerState, enabled: Set<ProviderInstanceID>, partial: Bool) -> TokenLedgerTotals {
+        state.totals(enabled: enabled, pending: partial, prices: self.prices, preview: self.preview.filter {
+            !enabled.contains($0.key) && !state.reconciled.contains($0.key)
+        })
     }
 
     package func delete(through cutoff: Date = Date()) -> Bool {
-        var state = self.state ?? self.load()
-        state.delete(through: cutoff)
-        // Explicit deletion also replaces a damaged file. Commit before publishing the reset.
         do {
-            try CredentialFileWriter.writePrivate(JSONEncoder().encode(state), to: self.file)
-            self.state = state
-            self.unreadable = false
-            self.dirty = false
+            let store = try self.open()
+            self.state = try store.transaction { store in
+                let previous = try store.load(LedgerState.self, .summary, "totals")
+                let state = LedgerState(
+                    timeZone: previous?.timeZone ?? TimeZone.current.identifier,
+                    deletedThrough: cutoff,
+                    reconciled: Set(ProviderInstanceID.supported))
+                for table in [UsageStore.Table.codex, .claude, .migration, .recovered] {
+                    try store.clear(table)
+                }
+                try store.save(state, .summary, "totals")
+                return state
+            }
+            let backup = self.backupFile
+            if FileManager.default.fileExists(atPath: backup.path) {
+                try FileManager.default.removeItem(at: backup)
+            }
+            self.backup = nil
+            self.preview = [:]
             return true
         } catch { return false }
     }
@@ -134,10 +205,10 @@ package actor HistoryCollector {
             return files.compactMap { entry -> (URL, Date)? in
                 guard let url = entry as? URL,
                       url
-                          .pathExtension == "jsonl" ||
-                          (provider == .codex && url.lastPathComponent.hasSuffix(".jsonl.zst")),
-                          let values = try? url.resourceValues(forKeys: Set(keys)),
-                          values.isRegularFile == true, values.isSymbolicLink != true
+                        .pathExtension == "jsonl" ||
+                        (provider == .codex && url.lastPathComponent.hasSuffix(".jsonl.zst")),
+                      let values = try? url.resourceValues(forKeys: Set(keys)),
+                      values.isRegularFile == true, values.isSymbolicLink != true
                 else { return nil }
                 return (url, values.contentModificationDate ?? .distantPast)
             }.sorted { $0.1 > $1.1 }.map(\.0)
@@ -145,98 +216,80 @@ package actor HistoryCollector {
     }
 
     private func read(
-        file: URL,
-        provider: ProviderInstanceID,
-        state: inout LedgerState,
-        budget: inout Int,
-        deadline: ContinuousClock.Instant) -> Bool
+        file: URL, state: inout LedgerState, scan: inout Scan) throws -> (ended: Bool, changed: Bool)
     {
         let key = LedgerIdentity.hash(file.path)
+        let old = try scan.store.load(TranscriptCursor.self, .cursor, key)
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
             guard let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
-                  let size = (attributes[.size] as? NSNumber)?.uint64Value else { return true }
+                  let size = (attributes[.size] as? NSNumber)?.uint64Value else { return (true, false) }
             let modified = attributes[.modificationDate] as? Date
-            let old = state.cursors[key]
-            if old?.fileID == inode, old?.modified == modified { return true }
+            let sameFile = old?.fileID == inode && old?.modified == modified && old?.size == size
+            if sameFile, old?.complete == true { return (true, false) }
             var cursor = TranscriptCursor(fileID: inode)
+            let ended: Bool
             if file.pathExtension == "zst" {
-                return self.readArchive(
-                    file,
-                    provider: provider,
-                    key: key,
-                    cursor: .init(fileID: inode),
-                    modified: modified,
-                    state: &state)
+                if sameFile, let old { cursor = old }
+                ended = try self.readArchive(
+                    file, cursor: &cursor, state: &state, scan: &scan)
+            } else {
+                let handle = try FileHandle(forReadingFrom: file)
+                defer { try? handle.close() }
+                if let old, old.fileID == inode, old.offset <= size,
+                   try self.anchor(handle, at: old.offset) == old.anchor
+                {
+                    cursor = old
+                }
+                try handle.seek(toOffset: cursor.offset)
+                ended = try self.readLines(
+                    handle, cursor: &cursor, state: &state, scan: &scan, acceptLast: false)
+                cursor.anchor = try self.anchor(handle, at: cursor.offset)
             }
-            let handle = try FileHandle(forReadingFrom: file)
-            defer { try? handle.close() }
-            if let old, old.fileID == inode, old.offset <= size,
-               try self.anchor(handle, at: old.offset) == old.anchor
-            {
-                cursor = old
-            }
-            try handle.seek(toOffset: cursor.offset)
-            let ended = try self.readLines(
-                handle,
-                provider: provider,
-                cursor: &cursor,
-                state: &state,
-                budget: &budget,
-                deadline: deadline,
-                acceptLast: false)
-            if ended { cursor.modified = modified }
-            cursor.anchor = try self.anchor(handle, at: cursor.offset)
-            state.cursors[key] = cursor
-            self.dirty = true
-            if cursor.parser.partial { state.partialProviders.insert(provider) }
-            return ended
+            cursor.modified = modified
+            cursor.size = size
+            cursor.complete = ended
+            try scan.store.save(cursor, .cursor, key)
+            if cursor.parser.partial { state.partialProviders.insert(scan.provider) }
+            return (ended, true)
+        } catch let error as UsageStore.Failure {
+            throw error
         } catch {
-            state.partialProviders.insert(provider)
-            self.dirty = true
-            return true
+            let changed = state.partialProviders.insert(scan.provider).inserted
+            return (true, changed)
         }
     }
 
     private func readArchive(
-        _ file: URL, provider: ProviderInstanceID, key: String, cursor initial: TranscriptCursor,
-        modified: Date?, state: inout LedgerState) -> Bool
+        _ file: URL, cursor: inout TranscriptCursor, state: inout LedgerState, scan: inout Scan) throws -> Bool
     {
         guard let command = ProviderProcess.command("zstd") else {
-            state.partialProviders.insert(provider)
-            self.dirty = true
-            return true
+            throw CocoaError(.fileReadUnsupportedScheme)
         }
-        var cursor = initial
-        do {
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = command.executable
-            process.arguments = ["-dc", "--", file.path]
-            process.environment = command.environment
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            defer { ProviderProcess.stop(process) }
-            var limit = 160 * 1024 * 1024
-            let ended = try self.readLines(
-                pipe.fileHandleForReading,
-                provider: provider,
-                cursor: &cursor,
-                state: &state,
-                budget: &limit,
-                deadline: .now + .seconds(4),
-                acceptLast: true)
-            if !ended || cursor.parser.partial || (process.isRunning == false && process.terminationStatus != 0) {
-                state.partialProviders.insert(provider)
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = command.executable
+        process.arguments = ["-dc", "--", file.path]
+        process.environment = command.environment
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer { ProviderProcess.stop(process) }
+        let handle = pipe.fileHandleForReading
+        var skip = cursor.offset
+        while skip > 0 {
+            guard let bytes = try handle.read(upToCount: Int(min(skip, 128 * 1024))), !bytes.isEmpty else {
+                throw CocoaError(.fileReadCorruptFile)
             }
-            cursor.modified = modified
-            state.cursors[key] = cursor
-        } catch {
-            state.partialProviders.insert(provider)
+            skip -= UInt64(bytes.count)
         }
-        self.dirty = true
-        return true
+        let ended = try self.readLines(
+            handle, cursor: &cursor, state: &state, scan: &scan, acceptLast: true)
+        if ended {
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { throw CocoaError(.fileReadCorruptFile) }
+        }
+        return ended
     }
 
     private func anchor(_ handle: FileHandle, at offset: UInt64) throws -> Data? {
@@ -248,31 +301,32 @@ package actor HistoryCollector {
     }
 
     private func readLines(
-        _ handle: FileHandle, provider: ProviderInstanceID, cursor: inout TranscriptCursor,
-        state: inout LedgerState, budget: inout Int, deadline: ContinuousClock.Instant, acceptLast: Bool) throws -> Bool
+        _ handle: FileHandle, cursor: inout TranscriptCursor, state: inout LedgerState,
+        scan: inout Scan, acceptLast: Bool) throws -> Bool
     {
         let maximumLine = 2 * 1024 * 1024
+        let deadline = acceptLast ? max(scan.deadline, .now + .milliseconds(500)) : scan.deadline
         var buffered = Data()
-        while budget > 0, ContinuousClock.now < deadline {
+        while scan.remaining > 0, ContinuousClock.now < deadline {
             guard let chunk = try handle.read(upToCount: 128 * 1024), !chunk.isEmpty else {
                 if acceptLast, !buffered.isEmpty, !cursor.discardingLine,
-                   let observation = cursor.parser.consume(buffered, provider: provider)
+                   let observation = cursor.parser.consume(buffered, provider: scan.provider)
                 {
-                    state.record(observation, provider: provider)
+                    try state.record(observation, store: scan.store, migrating: scan.migrating)
                 }
                 return true
             }
-            budget -= chunk.count
+            scan.remaining -= chunk.count
             var start = chunk.startIndex
             while let end = chunk[start...].firstIndex(of: 0x0A) {
                 let count = chunk.distance(from: start, to: end)
                 let length = buffered.count + count
                 if !cursor.discardingLine, length <= maximumLine {
                     buffered.append(chunk[start..<end])
-                    if let observation = cursor.parser.consume(buffered, provider: provider) {
-                        state.record(observation, provider: provider)
+                    if let observation = cursor.parser.consume(buffered, provider: scan.provider) {
+                        try state.record(observation, store: scan.store, migrating: scan.migrating)
                     }
-                } else if provider == .claude || buffered.range(of: Data("token_usage_record".utf8)) != nil {
+                } else if scan.provider == .claude || buffered.range(of: Data("token_usage_record".utf8)) != nil {
                     cursor.parser.partial = true
                 }
                 cursor.offset += UInt64(length + 1)
@@ -282,7 +336,7 @@ package actor HistoryCollector {
             }
             let tail = chunk[start...]
             if cursor.discardingLine || buffered.count + tail.count > maximumLine {
-                if provider == .claude || buffered.range(of: Data("token_usage_record".utf8)) != nil {
+                if scan.provider == .claude || buffered.range(of: Data("token_usage_record".utf8)) != nil {
                     cursor.parser.partial = true
                 }
                 cursor.offset += UInt64(buffered.count + tail.count)
@@ -295,36 +349,46 @@ package actor HistoryCollector {
         return false
     }
 
-    private func load() -> LedgerState {
-        var state = LedgerState(timeZone: self.legacyZone ?? TimeZone.current.identifier)
-        if FileManager.default.fileExists(atPath: self.file.path) {
-            do {
-                var restored = try JSONDecoder().decode(LedgerState.self, from: Data(contentsOf: self.file))
-                if restored.pricingInputsVersion == nil {
-                    // Revisit accessible originals once. Keep unmatched pre-migration token records.
-                    restored.cursors.removeAll()
-                    restored.pricingInputsVersion = 1
-                    self.dirty = true
-                }
-                return restored
-            } catch { self.unreadable = true }
-        } else if let legacyFile, let data = try? Data(contentsOf: legacyFile),
-                  let legacy = try? JSONDecoder().decode(LegacyHistory.self, from: data)
-        {
-            legacy.importSelected(into: &state)
-            self.dirty = true
+    private func open() throws -> UsageStore {
+        if let store = self.store { return store }
+        let manager = FileManager.default
+        let prior = self.file.deletingLastPathComponent().appendingPathComponent("history.json")
+        let backup = self.backupFile
+        if manager.fileExists(atPath: prior.path), !manager.fileExists(atPath: backup.path) {
+            // Rename on the same volume preserves the original bytes before creating a new format.
+            try manager.moveItem(at: prior, to: backup)
+            CredentialFileWriter.repairPermissions(at: backup)
         }
-        return state
+        let store = try UsageStore(file: self.file)
+        let exists = manager.fileExists(atPath: backup.path)
+        if exists { self.backup = backup }
+        self.state = try store.transaction { store in
+            if let state = try store.load(LedgerState.self, .summary, "totals") { return state }
+            var state = LedgerState(timeZone: self.legacyZone ?? TimeZone.current.identifier)
+            if exists {
+                let original = try self.priorLedger(PriorLedger.Metadata.self, backup)
+                state.timeZone = original.timeZone
+                state.deletedThrough = original.deletedThrough
+                state.observedProviders = original.observedProviders
+                state.legacyDays = original.legacyDays
+                state.legacyUndated = original.legacyUndated
+            } else if let legacyFile, let data = try? Data(contentsOf: legacyFile),
+                      let legacy = try? JSONDecoder().decode(LegacyHistory.self, from: data)
+            {
+                legacy.importSelected(into: &state)
+            }
+            try store.save(state, .summary, "totals")
+            return state
+        }
+        self.store = store
+        return store
     }
 
-    private func saveIfNeeded(_ state: LedgerState) -> Bool {
-        if self.unreadable { return false }
-        if self.dirty {
-            do {
-                try CredentialFileWriter.writePrivate(JSONEncoder().encode(state), to: self.file)
-                self.dirty = false
-            } catch { return false }
-        }
-        return true
+    private var backupFile: URL {
+        self.file.deletingLastPathComponent().appendingPathComponent("history-v1.backup.json")
+    }
+
+    private func priorLedger<Value: Decodable>(_ type: Value.Type, _ file: URL) throws -> Value {
+        try JSONDecoder().decode(type, from: Data(contentsOf: file, options: .mappedIfSafe))
     }
 }

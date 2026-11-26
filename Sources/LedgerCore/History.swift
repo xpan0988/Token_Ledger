@@ -1,126 +1,158 @@
 import Foundation
 
-struct HistoryBucket: Codable {
-    var tokens: Decimal
-}
+struct UsageSummary: Codable {
+    var models: [String: TokenCounts] = [:]
+    var days: [String: Int] = [:]
+    var opaque = 0
 
-struct HistoricalEvent: Codable {
-    let provider: ProviderInstanceID
-    let day: String
-    let tokens: Decimal
-    let pricing: RequestPricing?
-    let authoritative: Bool
+    var total: Int {
+        self.opaque + self.models.values.reduce(0) { $0 + $1.total }
+    }
+
+    mutating func add(_ counts: TokenCounts, model: String, day: String, removing: Bool = false) {
+        if removing {
+            self.models[model, default: .init()] -= counts
+            self.days[day, default: 0] -= counts.total
+        } else {
+            self.models[model, default: .init()] += counts
+            self.days[day, default: 0] += counts.total
+        }
+    }
+
+    mutating func merge(_ other: Self) {
+        self.models.merge(other.models, uniquingKeysWith: +)
+        self.days.merge(other.days, uniquingKeysWith: +)
+        self.opaque += other.opaque
+    }
 }
 
 struct LedgerState: Codable {
-    var pricingInputsVersion: Int? = 1
+    struct CodexThread: Codable {
+        var modern = false
+        var legacy: UsageSummary?
+        var legacyEnd: Date?
+    }
+
+    struct ClaudeFragment: Codable {
+        let request: String?
+        let model: String
+        let day: String
+        let counts: TokenCounts
+    }
+
     var timeZone = TimeZone.current.identifier
     var deletedThrough: Date?
-    var events: [String: HistoricalEvent] = [:]
-    var aliases: [String: String] = [:]
-    var ambiguousAliases: Set<String> = []
-    var cursors: [String: TranscriptCursor] = [:]
+    var usage: [ProviderInstanceID: UsageSummary] = [:]
+    var threads: [String: CodexThread] = [:]
     var partialProviders: Set<ProviderInstanceID> = []
     var observedProviders: Set<ProviderInstanceID> = []
     var legacyDays: [ProviderInstanceID: [String: HistoryBucket]] = [:]
     var legacyUndated: [ProviderInstanceID: HistoryBucket] = [:]
+    var reconciled: Set<ProviderInstanceID> = []
+    var recoveredProviders: Set<ProviderInstanceID> = []
 
-    mutating func record(_ row: UsageObservation, provider: ProviderInstanceID) {
+    mutating func record(_ row: UsageObservation, store: UsageStore, migrating: Bool) throws {
         guard self.deletedThrough.map({ row.date > $0 }) ?? true else { return }
         let day = Self.day(row.date, zone: self.timeZone)
-        let mapped = row.alias.flatMap { self.aliases[$0] }
-        if !row.authoritative {
-            if self.ambiguousAliases.contains(row.identity) { self.partialProviders.insert(provider) }
-            if self.aliases[row.identity] != nil { return }
-        }
-        if let prior = self.events[row.identity] {
-            guard prior.provider == provider else { return }
-            if prior.day != day { self.partialProviders.insert(provider) }
-            // Keep the largest complete observation of a request. Streamed rows can
-            // carry progressively larger output totals under the same message ID.
-            guard row.tokens > prior.tokens
-                || (row.tokens == prior.tokens && row.pricing != nil
-                    && (prior.pricing == nil || (prior.pricing?.model == nil && row.pricing?.model != nil)))
-            else { return }
-        } else if let alias = row.alias {
-            if let weak = self.events[alias], !weak.authoritative {
-                self.events.removeValue(forKey: alias)
-            }
-            if let mapped, mapped != row.identity { self.ambiguousAliases.insert(alias) }
-            self.aliases[alias] = mapped ?? row.identity
-        }
-        self.events[row.identity] = HistoricalEvent(
-            provider: provider,
-            day: day,
-            tokens: row.tokens,
-            pricing: row.pricing,
-            authoritative: row.authoritative)
-        self.observedProviders.insert(provider)
-    }
-
-    mutating func delete(through cutoff: Date) {
-        self = LedgerState(timeZone: self.timeZone, deletedThrough: cutoff, cursors: self.cursors)
-    }
-
-    func totals(stale: Bool, partial: Bool, prices: ModelPriceCatalog = .init()) -> TokenLedgerTotals {
-        var totals = TokenLedgerTotals()
-        totals.stale = stale
-        totals.tokenCoverageIsPartial = partial || !self.partialProviders.isEmpty
-        var current: [ProviderInstanceID: [String: Decimal]] = [:]
-        var knownCost: Decimal?
-        for event in self.events.values {
-            current[event.provider, default: [:]][event.day, default: 0] += event.tokens
-            if let quote = event.pricing.flatMap({ prices.quote($0, provider: event.provider) }),
-               let cost = TokenLedgerFormatting.decimal(quote.usd)
-            {
-                knownCost = (knownCost ?? 0) + cost
-                totals.usesCurrentPriceEstimate = totals.usesCurrentPriceEstimate || quote.basis == .current
-            } else {
-                totals.priceCoverageIsPartial = true
-                if let model = event.pricing?.model { totals.unknownPricingModels.insert(model) }
-            }
-        }
-        let providers = Set(current.keys).union(self.legacyDays.keys).union(self.legacyUndated.keys)
-        for provider in providers {
-            var dates = current[provider] ?? [:]
-            for (day, old) in self.legacyDays[provider] ?? [:] {
-                if let new = dates[day] {
-                    // The old checkpoint lacks event IDs. Day boundaries prove that
-                    // different dates are disjoint. A shared day is a lower bound.
-                    totals.tokenCoverageIsPartial = true
-                    dates[day] = max(new, old.tokens)
-                    totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || old.tokens > new
+        switch row.record {
+        case let .modern(thread, response, prefix):
+            if self.threads[thread]?.modern != true {
+                let prior = self.threads[thread]
+                let prefixMatches = if let prefix, let end = prior?.legacyEnd {
+                    end <= prefix
                 } else {
-                    dates[day] = old.tokens
-                    totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || old.tokens > 0
+                    false
                 }
+                self.threads[thread] = CodexThread(modern: true, legacy: prefixMatches ? prior?.legacy : nil)
             }
-            let dated = dates.values.reduce(Decimal.zero, +)
-            if let old = self.legacyUndated[provider], old.tokens > dated {
-                totals.tokens[provider] = old.tokens
-                totals.priceCoverageIsPartial = true
-            } else {
-                totals.tokens[provider] = dated
+            if try store.insert(.codex, response) {
+                self.usage[.codex, default: .init()].add(row.counts, model: row.model, day: day)
+                self.observedProviders.insert(.codex)
             }
-            totals.tokenCoverageIsPartial = totals.tokenCoverageIsPartial || self.legacyUndated[provider] != nil
+        case let .legacy(thread, mirror):
+            if migrating { _ = try store.insert(.migration, mirror) }
+            guard self.threads[thread]?.modern != true else { return }
+            if self.recoveredProviders.contains(.codex), try store.contains(.recovered, mirror) { return }
+            // The timestamp distinguishes a new epoch that happens to reach a previous counter value.
+            let key = LedgerIdentity.hash("\(mirror):\(row.date.timeIntervalSince1970):\(row.counts.signature)")
+            if try store.insert(.codex, key) {
+                var coverage = self.threads[thread] ?? CodexThread()
+                var summary = coverage.legacy ?? UsageSummary()
+                summary.add(row.counts, model: row.model, day: day)
+                coverage.legacy = summary
+                coverage.legacyEnd = max(coverage.legacyEnd ?? row.date, row.date)
+                self.threads[thread] = coverage
+                self.observedProviders.insert(.codex)
+            }
+        case let .claude(message, request):
+            if migrating, let request { _ = try store.insert(.migration, request) }
+            if self.recoveredProviders.contains(.claude), try store.contains(.recovered, request ?? message) { return }
+            var fragments = try store.load([ClaudeFragment].self, .claude, message) ?? []
+            let index = fragments.firstIndex { $0.request == request || $0.request == nil }
+            if let index {
+                let old = fragments[index]
+                guard (old.request == nil && request != nil) || row.counts.total > old.counts.total else { return }
+                self.usage[.claude, default: .init()].add(old.counts, model: old.model, day: old.day, removing: true)
+                fragments.remove(at: index)
+            } else if request == nil, !fragments.isEmpty {
+                return
+            }
+            fragments.append(ClaudeFragment(request: request, model: row.model, day: day, counts: row.counts))
+            try store.save(fragments, .claude, message)
+            self.usage[.claude, default: .init()].add(row.counts, model: row.model, day: day)
+            self.observedProviders.insert(.claude)
         }
-        for provider in self.observedProviders where totals.tokens[provider] == nil {
-            totals.tokens[provider] = 0
+    }
+
+    func summaries() -> [ProviderInstanceID: UsageSummary] {
+        var result = self.usage
+        for thread in self.threads.values {
+            if let legacy = thread.legacy { result[.codex, default: .init()].merge(legacy) }
         }
-        totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || totals.tokenCoverageIsPartial
-        totals.apiCosts = knownCost.map { [TokenLedgerAmount(currency: "USD", value: $0)] } ?? []
+        for provider in Set(self.legacyDays.keys).union(self.legacyUndated.keys) {
+            var summary = result[provider] ?? UsageSummary()
+            for (day, old) in self.legacyDays[provider] ?? [:] {
+                summary.opaque += max(0, old.tokens - summary.days[day, default: 0])
+            }
+            if let old = self.legacyUndated[provider] {
+                summary.opaque += max(0, old.tokens - summary.total)
+            }
+            result[provider] = summary
+        }
+        return result
+    }
+
+    func totals(
+        enabled: Set<ProviderInstanceID>, pending: Bool, prices: ModelPriceCatalog,
+        preview: [ProviderInstanceID: UsageSummary] = [:]) -> TokenLedgerTotals
+    {
+        var totals = TokenLedgerTotals()
+        let summaries = self.summaries()
+            .merging(preview) { current, saved in current.total >= saved.total ? current : saved }
+        totals.stale = enabled.isEmpty
+        totals.tokenCoverageIsPartial = pending || !self.partialProviders.isEmpty || !preview.isEmpty
+            || !self.observedProviders.union(summaries.keys).isSuperset(of: enabled)
+        totals.priceCoverageIsPartial = totals.tokenCoverageIsPartial
+        var cost: Decimal?
+        for provider in self.observedProviders.union(summaries.keys) {
+            let summary = summaries[provider] ?? UsageSummary()
+            totals.tokens[provider] = Decimal(summary.total)
+            let estimate = prices.estimate(summary, provider: provider)
+            if let usd = estimate.usd.flatMap(TokenLedgerFormatting.decimal) {
+                cost = (cost ?? 0) + usd
+            }
+            totals.priceCoverageIsPartial = totals.priceCoverageIsPartial || estimate.partial
+        }
+        totals.apiCosts = cost.map { [TokenLedgerAmount(currency: "USD", value: $0)] } ?? []
         return totals
     }
 
     static func day(_ date: Date, zone: String) -> String {
-        let style = Date.ISO8601FormatStyle(timeZone: TimeZone(identifier: zone) ?? .gmt)
-            .year().month().day().dateSeparator(.dash)
-        return date.formatted(style)
+        date.formatted(Date.ISO8601FormatStyle(timeZone: TimeZone(identifier: zone) ?? .gmt)
+            .year().month().day().dateSeparator(.dash))
     }
 }
 
-/// The shapes are the direct Codable layouts of the embedded app's checkpoint.
-/// Source identities and session-only totals from it carry no date-level join evidence.
 struct LegacyHistory: Decodable {
     struct Identity: Decodable, Hashable {
         let provider: ProviderInstanceID
@@ -129,7 +161,7 @@ struct LegacyHistory: Decodable {
     }
 
     struct Bucket: Decodable {
-        let tokens: Decimal?
+        let tokens: Int?
     }
 
     struct Source: Decodable {
@@ -149,7 +181,7 @@ struct LegacyHistory: Decodable {
             for key in Set(keys) where key.provider == provider {
                 guard let source = self.sources[key] else { continue }
                 if source.hasConfirmedEmpty { state.observedProviders.insert(provider) }
-                if source.partialTokens || source.partialPrices || source.ambiguousRotation {
+                if source.partialTokens || source.ambiguousRotation {
                     state.partialProviders.insert(provider)
                 }
                 for (day, old) in source.days
@@ -165,7 +197,7 @@ struct LegacyHistory: Decodable {
                 let sessions = source.sessions.values.compactMap(Self.bucket)
                 guard !sessions.isEmpty else { continue }
                 let undated = HistoryBucket(tokens: sessions.map(\.tokens).reduce(0, +))
-                let dayTotal = source.days.values.compactMap(\.tokens).reduce(Decimal.zero, +)
+                let dayTotal = source.days.values.compactMap(\.tokens).reduce(0, +)
                 if undated.tokens > dayTotal, undated.tokens > state.legacyUndated[provider]?.tokens ?? 0 {
                     state.legacyUndated[provider] = undated
                 }
@@ -174,7 +206,11 @@ struct LegacyHistory: Decodable {
     }
 
     private static func bucket(_ old: Bucket) -> HistoryBucket? {
-        guard let tokens = old.tokens, !tokens.isNaN, tokens >= 0 else { return nil }
+        guard let tokens = old.tokens, tokens >= 0 else { return nil }
         return HistoryBucket(tokens: tokens)
     }
+}
+
+struct HistoryBucket: Codable {
+    let tokens: Int
 }

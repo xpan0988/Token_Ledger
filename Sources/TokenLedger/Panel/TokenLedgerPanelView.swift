@@ -144,9 +144,11 @@ struct TokenLedgerPanelView: View {
 
     private func tokenSummary(providerOrder: [ProviderInstanceID]) -> some View {
         let totals = self.data.totals
-        let number = totals.totalTokens
+        let profile = self.data.codexProfile
+        let number = totals.displayTokens(codexLifetime: profile?.tokens)
         let notes = [
-            self.preferences.text("ledger.recordedOnly"),
+            self.preferences.text(profile == nil ? "ledger.recordedOnly" : "ledger.profileTokens"),
+            profile?.cached == true ? self.preferences.text("ledger.cachedProfileTokens") : nil,
             totals.tokenCoverageIsPartial ? self.preferences.text("ledger.partialTokens") : nil,
             totals.stale ? self.preferences.text("ledger.lastKnown") : nil,
             self.data.persistenceFailed ? self.preferences.text("ledger.persistenceFailed") : nil,
@@ -180,7 +182,6 @@ struct TokenLedgerPanelView: View {
         let priceNotes = [
             self.preferences.text("ledger.estimateOnly"),
             totals.priceCoverageIsPartial ? self.preferences.text("ledger.partialCost") : nil,
-            totals.usesCurrentPriceEstimate ? self.preferences.text("ledger.currentPriceEstimate") : nil,
             totals.stale ? self.preferences.text("ledger.lastKnown") : nil,
         ].compactMap(\.self)
         let includesEstimates = payments.contains(where: \.estimated)
@@ -190,6 +191,7 @@ struct TokenLedgerPanelView: View {
                 title: "ledger.apiEquivalent",
                 amounts: totals.apiCosts,
                 currency: currency,
+                approximate: true,
                 notes: priceNotes)
             self.moneyMetric(
                 title: "ledger.totalPaid",

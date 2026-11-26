@@ -4,16 +4,21 @@ import Darwin
 import Foundation
 
 package enum QuotaCollector {
+    package struct Result: Sendable {
+        package var quota: UsageSnapshot?
+        package var codexProfile: CodexProfileRead?
+    }
+
     package static func fetch(
         _ provider: ProviderInstanceID,
         workingDirectory: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment) async -> UsageSnapshot?
+        environment: [String: String] = ProcessInfo.processInfo.environment) async -> Result
     {
-        let probe = Task.detached(priority: .utility) { () -> UsageSnapshot? in
+        let probe = Task.detached(priority: .utility) {
             switch provider {
-            case .codex: try? Self.codex(workingDirectory, environment: environment)
-            case .claude: try? Self.claude(workingDirectory, environment: environment)
-            default: nil
+            case .codex: (try? Self.codex(workingDirectory, environment: environment)) ?? Result()
+            case .claude: Result(quota: try? Self.claude(workingDirectory, environment: environment))
+            default: Result()
             }
         }
         return await withTaskCancellationHandler {
@@ -23,8 +28,8 @@ package enum QuotaCollector {
         }
     }
 
-    private static func codex(_ workingDirectory: URL, environment: [String: String]) throws -> UsageSnapshot? {
-        guard let command = ProviderProcess.command("codex", environment: environment) else { return nil }
+    private static func codex(_ workingDirectory: URL, environment: [String: String]) throws -> Result {
+        guard let command = ProviderProcess.command("codex", environment: environment) else { return Result() }
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -42,6 +47,7 @@ package enum QuotaCollector {
         let outputFD = output.fileHandleForReading.fileDescriptor
         _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
         var buffer = Data()
+        var accountChanged = false
         func send(_ message: [String: Any]) throws {
             var data = try JSONSerialization.data(withJSONObject: message)
             data.append(0x0A)
@@ -53,8 +59,10 @@ package enum QuotaCollector {
                 while let newline = buffer.firstIndex(of: 0x0A) {
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(...newline)
-                    guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
-                          message["id"] as? Int == id else { continue }
+                    guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+                    else { continue }
+                    if message["method"] as? String == "account/updated" { accountChanged = true }
+                    guard message["id"] as? Int == id else { continue }
                     guard let result = message["result"] as? [String: Any] else { throw ProbeError.unavailable }
                     return result
                 }
@@ -70,8 +78,31 @@ package enum QuotaCollector {
         ]])
         _ = try response(1, timeout: .seconds(8))
         try send(["method": "initialized", "params": [:]])
-        try send(["id": 2, "method": "account/rateLimits/read", "params": [:]])
-        return try Self.codexWindows(response(2, timeout: .seconds(12)))
+        func request(
+            _ id: Int, _ method: String, params: [String: Any]? = nil,
+            timeout: Duration = .seconds(4)) -> [String: Any]?
+        {
+            guard !Task.isCancelled else { return nil }
+            var message: [String: Any] = ["id": id, "method": method]
+            message["params"] = params
+            do {
+                try send(message)
+                return try response(id, timeout: timeout)
+            } catch { return nil }
+        }
+
+        let quota = request(2, "account/rateLimits/read", params: [:], timeout: .seconds(12)).flatMap(Self.codexWindows)
+        let params = ["refreshToken": false]
+        guard let before = request(3, "account/read", params: params).flatMap(CodexProfileIdentity.init)
+        else { return Result(quota: quota) }
+        accountChanged = false
+        let tokens = request(4, "account/usage/read", timeout: .seconds(8)).flatMap(CodexProfileRead.lifetimeTokens)
+        guard let after = request(5, "account/read", params: params).flatMap(CodexProfileIdentity.init)
+        else { return Result(quota: quota) }
+        let profile = CodexProfileRead(
+            cacheKey: after.cacheKey,
+            tokens: before == after && !accountChanged ? tokens : nil)
+        return Result(quota: quota, codexProfile: profile)
     }
 
     static func codexWindows(_ result: [String: Any]) -> UsageSnapshot? {
@@ -154,19 +185,24 @@ package enum QuotaCollector {
         var capture = Data()
         var trustKeys = 3
         var screen = ""
+        var normalized = ""
+        var needsRender = false
         let cursorQuery = Data([0x1B, 0x5B, 0x36, 0x6E])
         while !Task.isCancelled, process.isRunning, ContinuousClock.now < deadline {
             if let received = try ProviderProcess.read(controlFD, wait: 180) {
                 guard !received.isEmpty, capture.count <= 512 * 1024 else { break }
+                let oldEnd = capture.count
                 capture.append(received)
-                if received.range(of: cursorQuery) != nil {
+                if capture.suffix(received.count + min(oldEnd, cursorQuery.count - 1)).range(of: cursorQuery) != nil {
                     try ProviderProcess.write(Data("\u{1b}[1;1R".utf8), to: controlFD)
                 }
-                if let text = String(data: capture, encoding: .utf8) {
-                    screen = ClaudeCLIScreen.render(text)
-                }
+                needsRender = true
             }
-            let normalized = screen.lowercased().filter { !$0.isWhitespace }
+            if needsRender, let text = String(data: capture, encoding: .utf8) {
+                screen = ClaudeCLIScreen.render(text)
+                normalized = screen.lowercased().filter { !$0.isWhitespace }
+                needsRender = false
+            }
             if normalized.contains("failedtoloadusagedata") { break }
             if normalized.contains("quicksafetycheck") || normalized.contains("doyoutrustthefilesinthisfolder") {
                 if trustKeys > 0, lastInput.duration(to: .now) > .milliseconds(500),

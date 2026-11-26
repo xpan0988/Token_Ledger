@@ -33,12 +33,13 @@
 "ledger.noReset" = "Reset time unavailable";
 "ledger.unavailable" = "Unavailable";
 "ledger.recordedOnly" = "Lifetime usage recorded from accessible local provider logs.";
-"ledger.partialTokens" = "Some token history is unavailable. The total covers recorded data only.";
-"ledger.partialCost" = "Some recorded usage has no eligible API list price.";
-"ledger.currentPriceEstimate" = "Some requests use the latest cached list prices because historical rates are unavailable.";
+"ledger.profileTokens" = "Codex uses the signed-in account’s Profile total. Claude and the distribution bar use local logs.";
+"ledger.cachedProfileTokens" = "Showing the last available Codex Profile total for this account.";
+"ledger.partialTokens" = "Some local token history is unavailable.";
+"ledger.partialCost" = "Some recorded usage could not be valued.";
 "ledger.lastKnown" = "Last known data";
 "ledger.persistenceFailed" = "The latest history could not be saved locally.";
-"ledger.estimateOnly" = "Theoretical API list-price estimate.";
+"ledger.estimateOnly" = "Approximate replacement value for local usage using premium Standard API rates for each provider’s two most-used models.";
 "ledger.includesEstimates" = "Includes estimated subscription payments.";
 "ledger.noConversion" = "Exchange rate unavailable for this display currency.";
 "ledger.rateDate" = "ExchangeRate-API rates last fetched %@";
@@ -65,4 +66,4 @@
 "ledger.loginFailure" = "Could not change launch at login.";
 "ledger.loginApproval" = "Approve Token Ledger in System Settings → Login Items.";
 "ledger.deleteHistory" = "Delete Recorded Usage…";
-"ledger.deleteHistoryHelp" = "Clears Token Ledger’s recorded usage. Provider logs and subscription payments are kept.";
+"ledger.deleteHistoryHelp" = "Clears Token Ledger’s local usage history. Codex Profile usage, provider logs and subscription payments are kept.";
